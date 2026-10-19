@@ -1,0 +1,9 @@
+{
+  "operador.demo": {
+    "username": "operador.demo",
+    "full_name": "Operador de Red",
+    "role": "Administrador LoRaWAN",
+    "password_sha256": "5487cf596c53bf12e05cec7d9e2b719478cba212eb9e146e927900b48825f872",
+    "created_at": "2024-01-01T00:00:00Z"
+  }
+}
