@@ -1,5 +1,111 @@
+# ==============================================================================
+# LORAWAN FULL STACK: CHIRPSTACK v4 + LORAWAN MONITOR
+# ==============================================================================
+# Este archivo orquesta la infraestructura completa:
+#  - ChirpStack v4 (Servidor LoRaWAN, REST API, Gateway Bridges, Mosquitto, Redis, Postgres)
+#  - LoRaWAN Monitor Backend (FastAPI, base de datos operativa, coordenadas y usuarios)
+# ==============================================================================
+
 services:
-  postgres:
+  # ----------------------------------------------------------------------------
+  # CHIRPSTACK v4 SERVICES
+  # ----------------------------------------------------------------------------
+  chirpstack:
+    image: chirpstack/chirpstack:4
+    command: -c /etc/chirpstack
+    restart: unless-stopped
+    volumes:
+      - ./chirpstack/configuration/chirpstack:/etc/chirpstack
+    depends_on:
+      - chirpstack-postgres
+      - mosquitto
+      - redis
+    environment:
+      - MQTT_BROKER_HOST=mosquitto
+      - REDIS_HOST=redis
+      - POSTGRESQL_HOST=chirpstack-postgres
+    ports:
+      - "8080:8080"
+    networks:
+      - lorawan_net
+
+  chirpstack-gateway-bridge:
+    image: chirpstack/chirpstack-gateway-bridge:4
+    restart: unless-stopped
+    ports:
+      - "1700:1700/udp"
+    volumes:
+      - ./chirpstack/configuration/chirpstack-gateway-bridge:/etc/chirpstack-gateway-bridge
+    environment:
+      - INTEGRATION__MQTT__EVENT_TOPIC_TEMPLATE=us915_1/gateway/{{ .GatewayID }}/event/{{ .EventType }}
+      - INTEGRATION__MQTT__STATE_TOPIC_TEMPLATE=us915_1/gateway/{{ .GatewayID }}/state/{{ .StateType }}
+      - INTEGRATION__MQTT__COMMAND_TOPIC_TEMPLATE=us915_1/gateway/{{ .GatewayID }}/command/#
+    depends_on:
+      - mosquitto
+    networks:
+      - lorawan_net
+
+  chirpstack-gateway-bridge-basicstation:
+    image: chirpstack/chirpstack-gateway-bridge:4
+    restart: unless-stopped
+    command: -c /etc/chirpstack-gateway-bridge/chirpstack-gateway-bridge-basicstation-us915_1.toml
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./chirpstack/configuration/chirpstack-gateway-bridge:/etc/chirpstack-gateway-bridge
+    depends_on:
+      - mosquitto
+    networks:
+      - lorawan_net
+
+  chirpstack-rest-api:
+    image: chirpstack/chirpstack-rest-api:4
+    restart: unless-stopped
+    command: --server chirpstack:8080 --bind 0.0.0.0:8090 --insecure
+    ports:
+      - "8090:8090"
+    depends_on:
+      - chirpstack
+    networks:
+      - lorawan_net
+
+  chirpstack-postgres:
+    image: postgres:14-alpine
+    container_name: chirpstack_postgres
+    restart: unless-stopped
+    volumes:
+      - ./chirpstack/configuration/postgresql/initdb:/docker-entrypoint-initdb.d
+      - chirpstack_postgresqldata:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=chirpstack
+      - POSTGRES_PASSWORD=chirpstack
+      - POSTGRES_DB=chirpstack
+    networks:
+      - lorawan_net
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 300 1 --save 60 100 --appendonly no
+    volumes:
+      - chirpstack_redisdata:/data
+    networks:
+      - lorawan_net
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./chirpstack/configuration/mosquitto/config/:/mosquitto/config/
+    networks:
+      - lorawan_net
+
+  # ----------------------------------------------------------------------------
+  # LORAWAN MONITOR SERVICES (SUPERVISIÓN OPERATIVA)
+  # ----------------------------------------------------------------------------
+  monitor-db:
     image: postgres:16-alpine
     container_name: lorawan_monitor_db
     restart: unless-stopped
@@ -8,41 +114,40 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lorawan_secret_2026}
       POSTGRES_DB: ${POSTGRES_DB:-lorawan_monitor}
     volumes:
-      - ./database/migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
-      - pgdata:/var/lib/postgresql/data
+      - ./monitor/database/migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
+      - monitor_pgdata:/var/lib/postgresql/data
     ports:
-      - "5433:5432" # Puerto 5433 en host para no colisionar con postgres en 5432
+      - "5433:5432"
     networks:
-      - default
+      - lorawan_net
 
-  backend:
-    build: ./backend
+  monitor-backend:
+    build: ./monitor/backend
     container_name: lorawan_monitor_api
     restart: unless-stopped
     env_file:
-      - .env
+      - ./monitor/.env
     volumes:
-      - ./backend/app:/app/app
-      - ./backend/data:/app/data
+      - ./monitor/backend/app:/app/app
+      - ./monitor/backend/data:/app/data
     environment:
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-lorawan_admin}:${POSTGRES_PASSWORD:-lorawan_secret_2026}@postgres:5432/${POSTGRES_DB:-lorawan_monitor}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-lorawan_admin}:${POSTGRES_PASSWORD:-lorawan_secret_2026}@monitor-db:5432/${POSTGRES_DB:-lorawan_monitor}
       - CHIRPSTACK_API_URL=http://chirpstack-rest-api:8090
       - CHIRPSTACK_MQTT_HOST=mosquitto
     depends_on:
-      - postgres
+      - monitor-db
+      - chirpstack-rest-api
     ports:
       - "8000:8000"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     networks:
-      - default
-      - chirpstack_net
+      - lorawan_net
 
 networks:
-  default:
-  chirpstack_net:
-    name: chirpstack-docker-master_default
-    external: true
+  lorawan_net:
+    name: lorawan_full_network
+    driver: bridge
 
 volumes:
-  pgdata:
+  chirpstack_postgresqldata:
+  chirpstack_redisdata:
+  monitor_pgdata:

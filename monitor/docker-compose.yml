@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lorawan_monitor_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lorawan_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lorawan_secret_2026}
+      POSTGRES_DB: ${POSTGRES_DB:-lorawan_monitor}
+    volumes:
+      - ./database/migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432" # Puerto 5433 en host para no colisionar con postgres en 5432
+    networks:
+      - default
+
+  backend:
+    build: ./backend
+    container_name: lorawan_monitor_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/data:/app/data
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-lorawan_admin}:${POSTGRES_PASSWORD:-lorawan_secret_2026}@postgres:5432/${POSTGRES_DB:-lorawan_monitor}
+      - CHIRPSTACK_API_URL=http://chirpstack-rest-api:8090
+      - CHIRPSTACK_MQTT_HOST=mosquitto
+    depends_on:
+      - postgres
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - chirpstack_net
+
+networks:
+  default:
+  chirpstack_net:
+    name: chirpstack-docker-master_default
+    external: true
+
+volumes:
+  pgdata:

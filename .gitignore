@@ -1,1 +1,2 @@
-.env
+monitor/.env
+chirpstack\configuration\mosquitto\config\passwd
