@@ -6,8 +6,13 @@ echo "   Iniciando LoRaWAN Monitor Backend en nuevo servidor   "
 echo "=========================================================="
 
 # 1. Asegurar carpetas de datos
-mkdir -p backend/data
-chmod -R 775 backend/data 2>/dev/null || true
+if [ -d "monitor/backend" ]; then
+    mkdir -p monitor/backend/data
+    chmod -R 775 monitor/backend/data 2>/dev/null || true
+else
+    mkdir -p backend/data
+    chmod -R 775 backend/data 2>/dev/null || true
+fi
 
 # 2. Verificar/crear red externa si no existe
 NET_NAME="chirpstack-docker-master_default"

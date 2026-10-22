@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 import uuid
 from app.schemas import AlarmDTO, AlarmSeverity, EntityType, OperationalEventDTO
@@ -10,19 +10,42 @@ SEVERITY_RANK: Dict[AlarmSeverity, int] = {
     "LOW": 1,
 }
 
+NODE_SILENT_SNOOZE_MINUTES = 20
+
 
 class OperationalAlarmEngine:
     """
     Motor de reglas operativas con deduplicación estricta, control de estados
-    (ACTIVE -> ACKNOWLEDGED -> RESOLVED) y registro de auditoría.
+    (ACTIVE -> ACKNOWLEDGED -> RESOLVED), silenciamiento temporal de 20 minutos
+    para alarmas de dispositivo inactivo (NODE_SILENT) y registro de auditoría.
     Jamás evalúa variables medidas por sensores.
     """
 
     def __init__(self) -> None:
         # Clave de deduplicación: (rule_code, entity_type, entity_id) -> AlarmDTO
         self.active_alarms: Dict[Tuple[str, EntityType, str], AlarmDTO] = {}
+        # Silenciamiento temporal tras reconocer alarma: (rule_code, entity_type, entity_id) -> datetime (UTC)
+        self.silenced_until: Dict[Tuple[str, EntityType, str], datetime] = {}
         self.resolved_alarms: List[AlarmDTO] = []
         self.events: List[OperationalEventDTO] = []
+
+    def is_silenced(
+        self,
+        rule_code: str,
+        entity_type: EntityType,
+        entity_id: str,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        current_time = now or datetime.now(timezone.utc)
+        key = (rule_code, entity_type, entity_id)
+        until = self.silenced_until.get(key)
+        if not until:
+            return False
+        if current_time < until:
+            return True
+        # Expiró la ventana de 20 minutos: limpiar para permitir nueva evaluación
+        self.silenced_until.pop(key, None)
+        return False
 
     def trigger_or_update(
         self,
@@ -37,22 +60,37 @@ class OperationalAlarmEngine:
         threshold_formatted: str,
         last_activity_at: Optional[datetime],
         now: Optional[datetime] = None,
-    ) -> Tuple[AlarmDTO, bool]:
+    ) -> Tuple[Optional[AlarmDTO], bool]:
         """
-        Retorna (AlarmDTO, is_new). Si ya existe una alarma ACTIVE o ACKNOWLEDGED
-        para (rule_code, entity_type, entity_id), actualiza el valor observado
-        sin duplicar la alarma ni reenviar notificación push.
+        Retorna (AlarmDTO | None, is_new).
+        Si la alarma fue reconocida y se encuentra dentro de la ventana de silencio
+        de 20 minutos (para NODE_SILENT), no se evalúa ni se muestra hasta que expire.
         """
         current_time = now or datetime.now(timezone.utc)
         key = (rule_code, entity_type, entity_id)
+
+        # Si está silenciada temporalmente (20 min), omitir evaluación y ocultarla
+        if self.is_silenced(rule_code, entity_type, entity_id, current_time):
+            if key in self.active_alarms:
+                self.active_alarms.pop(key, None)
+            return None, False
+
+        ts_str = (
+            last_activity_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            if last_activity_at
+            else "Sin comunicación registrada"
+        )
 
         if key in self.active_alarms:
             existing = self.active_alarms[key]
             existing.observed_value = observed_value
             existing.condition_description = condition_description
-            existing.age_minutes = max(
-                0, int((current_time - existing.detected_at).total_seconds() // 60)
-            )
+            existing.last_activity_at = last_activity_at
+            existing.last_activity_timestamp = ts_str
+            existing.threshold_formatted = threshold_formatted
+            diff_secs = max(0, int((current_time - existing.detected_at).total_seconds()))
+            existing.age_seconds = diff_secs
+            existing.age_minutes = diff_secs // 60
             return existing, False
 
         new_alarm = AlarmDTO(
@@ -68,8 +106,10 @@ class OperationalAlarmEngine:
             observed_value=observed_value,
             threshold_formatted=threshold_formatted,
             last_activity_at=last_activity_at,
+            last_activity_timestamp=ts_str,
             detected_at=current_time,
             age_minutes=0,
+            age_seconds=0,
         )
         self.active_alarms[key] = new_alarm
         self._record_event(
@@ -94,6 +134,8 @@ class OperationalAlarmEngine:
     ) -> Optional[AlarmDTO]:
         current_time = now or datetime.now(timezone.utc)
         key = (rule_code, entity_type, entity_id)
+        # Si el nodo se recupera, limpiar cualquier silenciamiento activo
+        self.silenced_until.pop(key, None)
         alarm = self.active_alarms.pop(key, None)
         if not alarm:
             return None
@@ -115,22 +157,38 @@ class OperationalAlarmEngine:
 
     def acknowledge(self, alarm_id: str, operator_name: str, now: Optional[datetime] = None) -> Optional[AlarmDTO]:
         current_time = now or datetime.now(timezone.utc)
-        for alarm in self.active_alarms.values():
+        for key, alarm in list(self.active_alarms.items()):
             if alarm.id == alarm_id:
                 if alarm.status == "ACTIVE":
                     alarm.status = "ACKNOWLEDGED"
                     alarm.acknowledged_at = current_time
                     alarm.acknowledged_by = operator_name
-                    self._record_event(
-                        entity_type=alarm.entity_type,
-                        entity_id=alarm.entity_id,
-                        entity_name=alarm.entity_name,
-                        event_type="ALARM_ACKNOWLEDGED",
-                        previous_state="ACTIVE",
-                        new_state="ACKNOWLEDGED",
-                        detail=f"Reconocida por {operator_name}",
-                        occurred_at=current_time,
-                    )
+
+                    if alarm.rule_code == "NODE_SILENT":
+                        # Silenciar y ocultar esta alarma específica de dispositivo inactivo durante 20 minutos
+                        self.silenced_until[key] = current_time + timedelta(minutes=NODE_SILENT_SNOOZE_MINUTES)
+                        self.active_alarms.pop(key, None)
+                        self._record_event(
+                            entity_type=alarm.entity_type,
+                            entity_id=alarm.entity_id,
+                            entity_name=alarm.entity_name,
+                            event_type="ALARM_ACKNOWLEDGED",
+                            previous_state="ACTIVE",
+                            new_state="SILENCED_20M",
+                            detail=f"Reconocida por {operator_name} (silenciada por {NODE_SILENT_SNOOZE_MINUTES} min)",
+                            occurred_at=current_time,
+                        )
+                    else:
+                        self._record_event(
+                            entity_type=alarm.entity_type,
+                            entity_id=alarm.entity_id,
+                            entity_name=alarm.entity_name,
+                            event_type="ALARM_ACKNOWLEDGED",
+                            previous_state="ACTIVE",
+                            new_state="ACKNOWLEDGED",
+                            detail=f"Reconocida por {operator_name}",
+                            occurred_at=current_time,
+                        )
                 return alarm
         return None
 

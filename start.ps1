@@ -4,8 +4,9 @@ Write-Host "   Iniciando LoRaWAN Monitor Backend en nuevo servidor   " -Foregrou
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # 1. Asegurar carpeta de datos
-if (-not (Test-Path "backend\data")) {
-    New-Item -ItemType Directory -Path "backend\data" -Force | Out-Null
+$dataPath = if (Test-Path "monitor\backend") { "monitor\backend\data" } else { "backend\data" }
+if (-not (Test-Path $dataPath)) {
+    New-Item -ItemType Directory -Path $dataPath -Force | Out-Null
 }
 
 # 2. Crear red docker si no existe

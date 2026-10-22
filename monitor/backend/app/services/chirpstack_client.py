@@ -11,12 +11,13 @@ logger = logging.getLogger("lorawan_monitor.chirpstack")
 
 def evaluate_communication_state(
     last_seen_at: Optional[datetime],
-    threshold_minutes: int,
+    threshold_value: int,
     now: Optional[datetime] = None,
+    unit: str = "minutes",
 ) -> Tuple[CommState, str, str, Optional[int]]:
     """
     Calcula el estado operativo real a partir de la última actividad conocida (lastSeenAt)
-    y un umbral configurable, sin presentarlo como una confirmación directa si es inferido.
+    y un umbral configurable (en segundos o minutos). Por defecto evalúa en minutos para compatibilidad.
     """
     current_time = now or datetime.now(timezone.utc)
     if last_seen_at is None:
@@ -28,19 +29,32 @@ def evaluate_communication_state(
         )
 
     elapsed_seconds = max(0.0, (current_time - last_seen_at).total_seconds())
+    elapsed_seconds_int = int(elapsed_seconds)
     elapsed_minutes = int(elapsed_seconds // 60)
+    ts_str = last_seen_at.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    if elapsed_minutes <= threshold_minutes:
+    if unit == "seconds":
+        threshold_sec = threshold_value
+        threshold_label = f"{threshold_value}s"
+        time_display = f"{elapsed_seconds_int}s"
+        is_active = elapsed_seconds_int <= threshold_sec
+    else:
+        threshold_sec = threshold_value * 60
+        threshold_label = f"{threshold_value} min"
+        time_display = f"{elapsed_minutes} min"
+        is_active = elapsed_minutes <= threshold_value
+
+    if is_active:
         return (
             "ACTIVE",
             "Activo (comunicación reciente)",
-            f"Calculado por última actividad hace {elapsed_minutes} min (umbral ≤ {threshold_minutes} min)",
+            f"Calculado por última actividad hace {time_display} (umbral ≤ {threshold_label})",
             elapsed_minutes,
         )
     return (
         "NO_COMMUNICATION",
         "Sin comunicación",
-        f"Inferido por inactividad de {elapsed_minutes} min (supera umbral de {threshold_minutes} min)",
+        f"Inferido por inactividad de {time_display} (supera umbral de {threshold_label}). Última transmisión: {ts_str}",
         elapsed_minutes,
     )
 
@@ -133,7 +147,19 @@ class ChirpStackV4Client:
         return {
             "Grpc-Metadata-Authorization": f"Bearer {settings.chirpstack_api_token}",
             "Accept": "application/json",
+            "Content-Type": "application/json",
         }
+
+    @staticmethod
+    def _check_response(response: httpx.Response) -> None:
+        if response.is_error:
+            msg = response.text
+            try:
+                err_data = response.json()
+                msg = err_data.get("message") or err_data.get("error") or response.text
+            except Exception:
+                pass
+            raise RuntimeError(f"ChirpStack ({response.status_code}): {msg}")
 
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         async with httpx.AsyncClient(
@@ -142,15 +168,119 @@ class ChirpStackV4Client:
             response = await client.get(
                 f"{self.base_url}{path}", headers=self.headers, params=params
             )
-            response.raise_for_status()
+            self._check_response(response)
             return response.json()
+
+    async def _post(self, path: str, json_data: Dict[str, Any]) -> Dict[str, Any]:
+        async with httpx.AsyncClient(
+            verify=settings.chirpstack_verify_ssl, timeout=12.0
+        ) as client:
+            response = await client.post(
+                f"{self.base_url}{path}", headers=self.headers, json=json_data
+            )
+            self._check_response(response)
+            return response.json() if response.content else {}
+
+    async def _put(self, path: str, json_data: Dict[str, Any]) -> Dict[str, Any]:
+        async with httpx.AsyncClient(
+            verify=settings.chirpstack_verify_ssl, timeout=12.0
+        ) as client:
+            response = await client.put(
+                f"{self.base_url}{path}", headers=self.headers, json=json_data
+            )
+            self._check_response(response)
+            return response.json() if response.content else {}
+
+    async def _delete(self, path: str) -> None:
+        async with httpx.AsyncClient(
+            verify=settings.chirpstack_verify_ssl, timeout=12.0
+        ) as client:
+            response = await client.delete(
+                f"{self.base_url}{path}", headers=self.headers
+            )
+            self._check_response(response)
+
+    # ---------------------------------------------------------------------------
+    # TENANTS
+    # ---------------------------------------------------------------------------
 
     async def fetch_tenants(self) -> List[Dict[str, Any]]:
         data = await self._get("/api/tenants", {"limit": 100})
         return [
-            {"tenant_id": item["id"], "name": item.get("name", "Sin nombre")}
+            {
+                "tenant_id": item["id"],
+                "name": item.get("name", "Sin nombre"),
+                "description": item.get("description", ""),
+                "can_have_gateways": bool(item.get("canHaveGateways", True)),
+                "max_device_count": int(item.get("maxDeviceCount", 0)),
+                "max_gateway_count": int(item.get("maxGatewayCount", 0)),
+            }
             for item in data.get("result", [])
         ]
+
+    async def get_tenant(self, tenant_id: str) -> Dict[str, Any]:
+        data = await self._get(f"/api/tenants/{tenant_id}")
+        t = data.get("tenant") or {}
+        return {
+            "tenant_id": t.get("id", tenant_id),
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "can_have_gateways": bool(t.get("canHaveGateways", True)),
+            "max_device_count": int(t.get("maxDeviceCount", 0)),
+            "max_gateway_count": int(t.get("maxGatewayCount", 0)),
+        }
+
+    async def create_tenant(
+        self,
+        name: str,
+        description: str = "",
+        can_have_gateways: bool = True,
+        max_device_count: int = 0,
+        max_gateway_count: int = 0,
+    ) -> str:
+        payload = {
+            "tenant": {
+                "name": name,
+                "description": description,
+                "canHaveGateways": can_have_gateways,
+                "maxDeviceCount": max_device_count,
+                "maxGatewayCount": max_gateway_count,
+                "privateGatewaysUp": False,
+                "privateGatewaysDown": False,
+            }
+        }
+        res = await self._post("/api/tenants", payload)
+        return res.get("id", "")
+
+    async def update_tenant(
+        self,
+        tenant_id: str,
+        name: str,
+        description: str = "",
+        can_have_gateways: bool = True,
+        max_device_count: int = 0,
+        max_gateway_count: int = 0,
+    ) -> None:
+        payload = {
+            "tenant": {
+                "id": tenant_id,
+                "name": name,
+                "description": description,
+                "canHaveGateways": can_have_gateways,
+                "maxDeviceCount": max_device_count,
+                "maxGatewayCount": max_gateway_count,
+                "privateGatewaysUp": False,
+                "privateGatewaysDown": False,
+            }
+        }
+        await self._put(f"/api/tenants/{tenant_id}", payload)
+
+    async def delete_tenant(self, tenant_id: str) -> None:
+        await self._delete(f"/api/tenants/{tenant_id}")
+
+    # ---------------------------------------------------------------------------
+    # APPLICATIONS
+    # ---------------------------------------------------------------------------
 
     async def fetch_applications(self, tenant_id: str) -> List[Dict[str, Any]]:
         data = await self._get("/api/applications", {"tenantId": tenant_id, "limit": 100})
@@ -159,9 +289,242 @@ class ChirpStackV4Client:
                 "application_id": item["id"],
                 "tenant_id": tenant_id,
                 "name": item.get("name", "Sin nombre"),
+                "description": item.get("description", ""),
             }
             for item in data.get("result", [])
         ]
+
+    async def get_application(self, application_id: str) -> Dict[str, Any]:
+        data = await self._get(f"/api/applications/{application_id}")
+        app = data.get("application") or {}
+        return {
+            "application_id": app.get("id", application_id),
+            "tenant_id": app.get("tenantId", ""),
+            "name": app.get("name", ""),
+            "description": app.get("description", ""),
+        }
+
+    async def create_application(self, name: str, description: str, tenant_id: str) -> str:
+        payload = {
+            "application": {
+                "name": name,
+                "description": description,
+                "tenantId": tenant_id,
+            }
+        }
+        res = await self._post("/api/applications", payload)
+        return res.get("id", "")
+
+    async def update_application(self, application_id: str, name: str, description: str = "") -> None:
+        current = await self.get_application(application_id)
+        payload = {
+            "application": {
+                "id": application_id,
+                "name": name,
+                "description": description,
+                "tenantId": current["tenant_id"],
+            }
+        }
+        await self._put(f"/api/applications/{application_id}", payload)
+
+    async def delete_application(self, application_id: str) -> None:
+        await self._delete(f"/api/applications/{application_id}")
+
+    # ---------------------------------------------------------------------------
+    # DEVICE PROFILES
+    # ---------------------------------------------------------------------------
+
+    async def fetch_device_profiles(
+        self,
+        tenant_id: Optional[str] = None,
+        include_vendors: bool = True,
+    ) -> List[Dict[str, Any]]:
+        profiles: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        # 1. Perfiles propios de Tenant (tenantOnly=True)
+        tenant_ids: List[str] = []
+        if tenant_id:
+            tenant_ids = [tenant_id]
+        else:
+            try:
+                tenants = await self.fetch_tenants()
+                tenant_ids = [t["tenant_id"] for t in tenants if t.get("tenant_id")]
+            except Exception:
+                tenant_ids = []
+
+        for tid in tenant_ids:
+            try:
+                t_data = await self._get(
+                    "/api/device-profiles",
+                    {"tenantId": tid, "tenantOnly": True, "limit": 200},
+                )
+            except Exception:
+                continue
+
+            for item in t_data.get("result", []):
+                pid = item["id"]
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                detail: Dict[str, Any] = {}
+                try:
+                    detail = await self.get_device_profile(pid)
+                except Exception:
+                    detail = {}
+                profiles.append(
+                    {
+                        "id": pid,
+                        "tenant_id": detail.get("tenant_id") or tid,
+                        "name": item.get("name", "Sin nombre").strip(),
+                        "description": detail.get("description") or item.get("description", ""),
+                        "region": item.get("region", "US915"),
+                        "region_config_id": detail.get("region_config_id") or item.get("regionConfigId", ""),
+                        "mac_version": item.get("macVersion", "LORAWAN_1_0_3"),
+                        "reg_params_revision": item.get("regParamsRevision", "A"),
+                        "supports_otaa": bool(item.get("supportsOtaa", True)),
+                        "supports_class_b": bool(item.get("supportsClassB", False)),
+                        "supports_class_c": bool(item.get("supportsClassC", False)),
+                        "uplink_interval": int(detail.get("uplink_interval") or item.get("uplinkInterval") or 3600),
+                        "payload_codec_runtime": detail.get("payload_codec_runtime") or item.get("payloadCodecRuntime") or "NONE",
+                        "payload_codec_script": "",
+                        "vendor_id": item.get("vendorId", "") or "",
+                        "vendor_name": item.get("vendorName", "") or "",
+                        "device_id": item.get("deviceId", "") or "",
+                        "device_name": item.get("deviceName", "") or "",
+                        "firmware_version": item.get("firmwareVersion", "") or "",
+                        "is_tenant_profile": True,
+                        "created_at": item.get("createdAt"),
+                        "updated_at": item.get("updatedAt"),
+                    }
+                )
+
+        # 2. Perfiles globales por Vendor (globalOnly=True)
+        if include_vendors:
+            try:
+                g_data = await self._get(
+                    "/api/device-profiles",
+                    {"globalOnly": True, "limit": 2000},
+                )
+                for item in g_data.get("result", []):
+                    pid = item["id"]
+                    if pid in seen_ids:
+                        continue
+                    seen_ids.add(pid)
+                    v_name = (item.get("vendorName") or "").strip()
+                    profiles.append(
+                        {
+                            "id": pid,
+                            "tenant_id": "",
+                            "name": item.get("name", "Sin nombre").strip(),
+                            "description": item.get("deviceName", "") or "",
+                            "region": item.get("region", "US915"),
+                            "region_config_id": item.get("regionConfigId", "") or "",
+                            "mac_version": item.get("macVersion", "LORAWAN_1_0_3"),
+                            "reg_params_revision": item.get("regParamsRevision", "A"),
+                            "supports_otaa": bool(item.get("supportsOtaa", True)),
+                            "supports_class_b": bool(item.get("supportsClassB", False)),
+                            "supports_class_c": bool(item.get("supportsClassC", False)),
+                            "uplink_interval": 3600,
+                            "payload_codec_runtime": "JS" if v_name else "NONE",
+                            "payload_codec_script": "",
+                            "vendor_id": item.get("vendorId", "") or "",
+                            "vendor_name": v_name or "Otros Vendors",
+                            "device_id": item.get("deviceId", "") or "",
+                            "device_name": (item.get("deviceName") or item.get("name") or "").strip(),
+                            "firmware_version": item.get("firmwareVersion", "") or "",
+                            "is_tenant_profile": False,
+                            "created_at": item.get("createdAt"),
+                            "updated_at": item.get("updatedAt"),
+                        }
+                    )
+            except Exception:
+                pass
+
+        return profiles
+
+    async def get_device_profile(self, profile_id: str) -> Dict[str, Any]:
+        data = await self._get(f"/api/device-profiles/{profile_id}")
+        dp = data.get("deviceProfile") or {}
+        return {
+            "id": dp.get("id", profile_id),
+            "tenant_id": dp.get("tenantId", ""),
+            "name": dp.get("name", ""),
+            "description": dp.get("description", ""),
+            "region": dp.get("region", "US915"),
+            "region_config_id": dp.get("regionConfigId", ""),
+            "mac_version": dp.get("macVersion", "LORAWAN_1_0_3"),
+            "reg_params_revision": dp.get("regParamsRevision", "A"),
+            "adr_algorithm_id": dp.get("adrAlgorithmId", "default"),
+            "supports_otaa": bool(dp.get("supportsOtaa", True)),
+            "supports_class_b": bool(dp.get("supportsClassB", False)),
+            "supports_class_c": bool(dp.get("supportsClassC", False)),
+            "uplink_interval": int(dp.get("uplinkInterval", 3600)),
+            "payload_codec_runtime": dp.get("payloadCodecRuntime", "NONE"),
+            "payload_codec_script": dp.get("payloadCodecScript", ""),
+            "created_at": data.get("createdAt"),
+            "updated_at": data.get("updatedAt"),
+        }
+
+    async def create_device_profile(self, data: Dict[str, Any]) -> str:
+        dp_body: Dict[str, Any] = {
+            "tenantId": data["tenant_id"],
+            "name": data["name"],
+            "description": data.get("description", ""),
+            "region": data.get("region", "US915"),
+            "macVersion": data.get("mac_version", "LORAWAN_1_0_3"),
+            "regParamsRevision": data.get("reg_params_revision", "A"),
+            "adrAlgorithmId": data.get("adr_algorithm_id", "default"),
+            "flushQueueOnActivate": True,
+            "uplinkInterval": int(data.get("uplink_interval", 3600)),
+            "supportsOtaa": bool(data.get("supports_otaa", True)),
+            "supportsClassB": bool(data.get("supports_class_b", False)),
+            "supportsClassC": bool(data.get("supports_class_c", False)),
+            "autoDetectMeasurements": True,
+            "payloadCodecRuntime": data.get("payload_codec_runtime", "NONE"),
+            "payloadCodecScript": data.get("payload_codec_script", ""),
+        }
+        region_cfg = (data.get("region_config_id") or "").strip()
+        if region_cfg:
+            dp_body["regionConfigId"] = region_cfg
+        payload = {"deviceProfile": dp_body}
+        res = await self._post("/api/device-profiles", payload)
+        return res.get("id", "")
+
+    async def update_device_profile(self, profile_id: str, data: Dict[str, Any]) -> None:
+        current = await self.get_device_profile(profile_id)
+        dp_body: Dict[str, Any] = {
+            "id": profile_id,
+            "tenantId": current["tenant_id"],
+            "name": data["name"],
+            "description": data.get("description", current.get("description", "")),
+            "region": data.get("region", current.get("region", "US915")),
+            "macVersion": data.get("mac_version", current.get("mac_version", "LORAWAN_1_0_3")),
+            "regParamsRevision": data.get("reg_params_revision", current.get("reg_params_revision", "A")),
+            "adrAlgorithmId": data.get("adr_algorithm_id", current.get("adr_algorithm_id", "default")),
+            "flushQueueOnActivate": True,
+            "uplinkInterval": int(data.get("uplink_interval", current.get("uplink_interval", 3600))),
+            "supportsOtaa": bool(data.get("supports_otaa", current.get("supports_otaa", True))),
+            "supportsClassB": bool(data.get("supports_class_b", current.get("supports_class_b", False))),
+            "supportsClassC": bool(data.get("supports_class_c", current.get("supports_class_c", False))),
+            "autoDetectMeasurements": True,
+            "payloadCodecRuntime": data.get("payload_codec_runtime", current.get("payload_codec_runtime", "NONE")),
+            "payloadCodecScript": data.get("payload_codec_script", current.get("payload_codec_script", "")),
+        }
+        region_cfg = data.get("region_config_id")
+        if region_cfg is None:
+            region_cfg = current.get("region_config_id", "")
+        if region_cfg:
+            dp_body["regionConfigId"] = region_cfg.strip()
+        payload = {"deviceProfile": dp_body}
+        await self._put(f"/api/device-profiles/{profile_id}", payload)
+
+    async def delete_device_profile(self, profile_id: str) -> None:
+        await self._delete(f"/api/device-profiles/{profile_id}")
+
+    # ---------------------------------------------------------------------------
+    # DEVICES & GATEWAYS (LECTURA EXISTENTE)
+    # ---------------------------------------------------------------------------
 
     async def fetch_devices(self, application_id: str, tenant_id: str) -> List[Dict[str, Any]]:
         data = await self._get("/api/devices", {"applicationId": application_id, "limit": 500})
@@ -215,6 +578,139 @@ class ChirpStackV4Client:
                 }
             )
         return gateways
+
+    # ---------------------------------------------------------------------------
+    # GATEWAYS (GESTIÓN)
+    # ---------------------------------------------------------------------------
+
+    async def get_gateway(self, gateway_id: str) -> Dict[str, Any]:
+        data = await self._get(f"/api/gateways/{gateway_id}")
+        gw = data.get("gateway", {})
+        loc = gw.get("location") or {}
+        return {
+            "gateway_id": gw.get("gatewayId", gateway_id),
+            "name": gw.get("name", ""),
+            "description": gw.get("description", ""),
+            "tenant_id": gw.get("tenantId", ""),
+            "stats_interval": gw.get("statsInterval", 30),
+            "latitude": loc.get("latitude"),
+            "longitude": loc.get("longitude"),
+            "altitude": loc.get("altitude"),
+        }
+
+    async def create_gateway(self, data: Dict[str, Any]) -> str:
+        loc = {}
+        if data.get("latitude") is not None and data.get("longitude") is not None:
+            loc = {
+                "latitude": float(data["latitude"]),
+                "longitude": float(data["longitude"]),
+                "altitude": float(data.get("altitude") or 0.0),
+            }
+        payload = {
+            "gateway": {
+                "gatewayId": data["gateway_id"].strip().lower(),
+                "name": data["name"].strip(),
+                "description": data.get("description", ""),
+                "tenantId": data["tenant_id"],
+                "statsInterval": int(data.get("stats_interval", 30)),
+                "location": loc,
+            }
+        }
+        await self._post("/api/gateways", payload)
+        return data["gateway_id"].strip().lower()
+
+    async def update_gateway(self, gateway_id: str, data: Dict[str, Any]) -> None:
+        current = await self.get_gateway(gateway_id)
+        lat = data.get("latitude", current.get("latitude"))
+        lon = data.get("longitude", current.get("longitude"))
+        loc = {}
+        if lat is not None and lon is not None:
+            loc = {
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "altitude": float(data.get("altitude", current.get("altitude") or 0.0)),
+            }
+        payload = {
+            "gateway": {
+                "gatewayId": gateway_id,
+                "name": data["name"].strip(),
+                "description": data.get("description", current.get("description", "")),
+                "statsInterval": int(data.get("stats_interval", current.get("stats_interval", 30))),
+                "location": loc,
+            }
+        }
+        await self._put(f"/api/gateways/{gateway_id}", payload)
+
+    async def delete_gateway(self, gateway_id: str) -> None:
+        await self._delete(f"/api/gateways/{gateway_id}")
+
+    # ---------------------------------------------------------------------------
+    # DEVICES (GESTIÓN Y LLAVES OTAA)
+    # ---------------------------------------------------------------------------
+
+    async def get_device(self, dev_eui: str) -> Dict[str, Any]:
+        data = await self._get(f"/api/devices/{dev_eui}")
+        d = data.get("device", {})
+        return {
+            "dev_eui": d.get("devEui", dev_eui),
+            "name": d.get("name", ""),
+            "description": d.get("description", ""),
+            "application_id": d.get("applicationId", ""),
+            "device_profile_id": d.get("deviceProfileId", ""),
+            "is_disabled": bool(d.get("isDisabled", False)),
+            "skip_fcnt_check": bool(d.get("skipFcntCheck", False)),
+        }
+
+    async def create_device(self, data: Dict[str, Any]) -> str:
+        dev_eui = data["dev_eui"].strip().lower()
+        payload = {
+            "device": {
+                "devEui": dev_eui,
+                "name": data["name"].strip(),
+                "description": data.get("description", ""),
+                "applicationId": data["application_id"],
+                "deviceProfileId": data["device_profile_id"],
+                "isDisabled": bool(data.get("is_disabled", False)),
+                "skipFcntCheck": bool(data.get("skip_fcnt_check", False)),
+            }
+        }
+        await self._post("/api/devices", payload)
+
+        app_key = data.get("app_key")
+        if app_key and app_key.strip():
+            await self.set_device_keys(dev_eui, app_key.strip().lower())
+
+        return dev_eui
+
+    async def set_device_keys(self, dev_eui: str, app_key: str) -> None:
+        payload = {
+            "deviceKeys": {
+                "devEui": dev_eui.strip().lower(),
+                "nwkKey": app_key.strip().lower(),
+            }
+        }
+        try:
+            await self._post(f"/api/devices/{dev_eui}/keys", payload)
+        except Exception:
+            await self._put(f"/api/devices/{dev_eui}/keys", payload)
+
+    async def update_device(self, dev_eui: str, data: Dict[str, Any]) -> None:
+        current = await self.get_device(dev_eui)
+        payload = {
+            "device": {
+                "devEui": dev_eui,
+                "name": data["name"].strip(),
+                "description": data.get("description", current.get("description", "")),
+                "applicationId": current["application_id"],
+                "deviceProfileId": data.get("device_profile_id", current["device_profile_id"]),
+                "isDisabled": bool(data.get("is_disabled", current["is_disabled"])),
+                "skipFcntCheck": current["skip_fcnt_check"],
+            }
+        }
+        await self._put(f"/api/devices/{dev_eui}", payload)
+
+    async def delete_device(self, dev_eui: str) -> None:
+        await self._delete(f"/api/devices/{dev_eui}")
 
     @staticmethod
     def _parse_iso(value: Optional[str]) -> Optional[datetime]:
