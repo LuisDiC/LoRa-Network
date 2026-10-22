@@ -13,6 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
 
+from app.auth import hash_password, verify_password
 from app.config import settings
 from app.schemas import (
     AlarmDTO,
@@ -103,20 +104,8 @@ class RuntimeStore:
         self.chirpstack_connected: bool = True
         self.chirpstack_status_detail: str = "Conectado a ChirpStack v4"
         self.last_sync_at: datetime = datetime.now(timezone.utc)
-        self.rules: Dict[str, AlarmRuleUpdateDTO] = {
-            "NODE_SILENT": AlarmRuleUpdateDTO(
-                code="NODE_SILENT", severity="CRITICAL", threshold_value=30, tolerance_minutes=5, is_enabled=True
-            ),
-            "GATEWAY_OFFLINE": AlarmRuleUpdateDTO(
-                code="GATEWAY_OFFLINE", severity="HIGH", threshold_value=15, tolerance_minutes=2, is_enabled=True
-            ),
-            "LOW_BATTERY": AlarmRuleUpdateDTO(
-                code="LOW_BATTERY", severity="HIGH", threshold_value=15, tolerance_minutes=0, is_enabled=True
-            ),
-            "CHIRPSTACK_DISCONNECTED": AlarmRuleUpdateDTO(
-                code="CHIRPSTACK_DISCONNECTED", severity="CRITICAL", threshold_value=1, tolerance_minutes=0, is_enabled=True
-            ),
-        }
+        self.rules_file = Path("data/alarm_rules.json")
+        self.rules: Dict[str, AlarmRuleUpdateDTO] = self._load_rules()
         self.user_prefs: Dict[str, NotificationPreferencesDTO] = {
             "operador.demo": NotificationPreferencesDTO(
                 push_enabled=True,
@@ -131,6 +120,7 @@ class RuntimeStore:
                 notify_recovery=True,
             )
         }
+        self.push_tokens: Dict[str, List[str]] = {}
         self.custom_locations_file = Path("data/custom_locations.json")
         self.custom_locations: Dict[str, Dict[str, float]] = self._load_custom_locations()
         self.node_alerts_file = Path("data/node_alerts.json")
@@ -143,6 +133,57 @@ class RuntimeStore:
         self.raw_gateways: List[Dict] = []
         self.ws_clients: List[WebSocket] = []
         self.evaluate_all()
+
+    def get_user_prefs(self, username: str) -> NotificationPreferencesDTO:
+        if username not in self.user_prefs:
+            self.user_prefs[username] = NotificationPreferencesDTO(
+                push_enabled=True,
+                notify_critical=True,
+                notify_high=True,
+                notify_medium=True,
+                notify_low=False,
+                notify_node_silent=True,
+                notify_gateway_offline=True,
+                notify_low_battery=True,
+                notify_chirpstack_loss=True,
+                notify_recovery=True,
+            )
+        return self.user_prefs[username]
+
+    def _load_rules(self) -> Dict[str, AlarmRuleUpdateDTO]:
+        defaults = {
+            "NODE_SILENT": AlarmRuleUpdateDTO(
+                code="NODE_SILENT", severity="CRITICAL", threshold_value=45, unit="seconds", tolerance_minutes=0, is_enabled=True
+            ),
+            "GATEWAY_OFFLINE": AlarmRuleUpdateDTO(
+                code="GATEWAY_OFFLINE", severity="HIGH", threshold_value=15, unit="minutes", tolerance_minutes=2, is_enabled=True
+            ),
+            "LOW_BATTERY": AlarmRuleUpdateDTO(
+                code="LOW_BATTERY", severity="HIGH", threshold_value=15, unit="%", tolerance_minutes=0, is_enabled=True
+            ),
+            "CHIRPSTACK_DISCONNECTED": AlarmRuleUpdateDTO(
+                code="CHIRPSTACK_DISCONNECTED", severity="CRITICAL", threshold_value=1, unit="minutes", tolerance_minutes=0, is_enabled=True
+            ),
+        }
+        try:
+            if self.rules_file.exists():
+                with open(self.rules_file, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                    if isinstance(raw, dict):
+                        for k, v in raw.items():
+                            if isinstance(v, dict):
+                                defaults[k] = AlarmRuleUpdateDTO(**v)
+        except Exception as e:
+            logger.warning("No se pudo cargar alarm_rules.json: %s", e)
+        return defaults
+
+    def _save_rules(self) -> None:
+        try:
+            self.rules_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.rules_file, "w", encoding="utf-8") as f:
+                json.dump({k: v.model_dump() for k, v in self.rules.items()}, f, indent=2)
+        except Exception as e:
+            logger.error("Error guardando alarm_rules.json: %s", e)
 
     def _load_custom_locations(self) -> Dict[str, Dict[str, float]]:
         try:
@@ -252,12 +293,35 @@ class RuntimeStore:
         nodes_dto: List[NodeMetadataDTO] = []
         for raw in self.raw_nodes:
             dev_eui = raw["dev_eui"]
+            dev_eui_lower = dev_eui.lower()
             if dev_eui in self.custom_locations:
                 raw["latitude"] = self.custom_locations[dev_eui].get("latitude")
                 raw["longitude"] = self.custom_locations[dev_eui].get("longitude")
+            elif dev_eui_lower in self.custom_locations:
+                raw["latitude"] = self.custom_locations[dev_eui_lower].get("latitude")
+                raw["longitude"] = self.custom_locations[dev_eui_lower].get("longitude")
+
+            node_cfg = self.node_alerts.get(dev_eui_lower) or self.node_alerts.get(dev_eui)
+            if node_cfg:
+                inact_enabled = bool(node_cfg.get("inactivity_enabled", node_rule.is_enabled))
+                inact_val = int(node_cfg.get("inactivity_seconds", 60))
+                inact_unit = "seconds"
+                bat_enabled = bool(node_cfg.get("low_battery_enabled", bat_rule.is_enabled))
+                bat_thresh = int(node_cfg.get("low_battery_threshold", bat_rule.threshold_value))
+            else:
+                inact_enabled = node_rule.is_enabled
+                inact_val = node_rule.threshold_value
+                inact_unit = getattr(node_rule, "unit", "minutes") or "minutes"
+                bat_enabled = bat_rule.is_enabled
+                bat_thresh = bat_rule.threshold_value
 
             state, label, criteria, mins = evaluate_communication_state(
-                raw["last_seen_at"], node_rule.threshold_value, now
+                raw["last_seen_at"], inact_val, now, unit=inact_unit
+            )
+            secs_since = (
+                int(max(0.0, (now - raw["last_seen_at"]).total_seconds()))
+                if raw.get("last_seen_at")
+                else None
             )
             has_loc, loc_display = format_location(raw["latitude"], raw["longitude"])
             bat_display = format_battery(raw["battery_level"], raw["external_power"])
@@ -267,8 +331,15 @@ class RuntimeStore:
                 else "No disponible"
             )
 
-            # Evaluación de alarma de desconexión de nodo
-            if state == "NO_COMMUNICATION" and node_rule.is_enabled and mins is not None:
+            # Evaluación de alarma de desconexión de nodo (respeta alerta individual o regla global)
+            if state == "NO_COMMUNICATION" and inact_enabled and mins is not None:
+                if inact_unit == "seconds":
+                    elapsed_str = f"{secs_since if secs_since is not None else mins * 60}s"
+                    thresh_str = f"{inact_val}s"
+                else:
+                    elapsed_str = f"{mins} min"
+                    thresh_str = f"{inact_val} min"
+
                 alarm_engine.trigger_or_update(
                     rule_code="NODE_SILENT",
                     severity=node_rule.severity,
@@ -277,15 +348,15 @@ class RuntimeStore:
                     entity_name=raw["name"],
                     title="Nodo sin comunicación",
                     condition_description=(
-                        f"El nodo no ha transmitido uplinks durante {mins} minutos "
-                        f"(umbral configurado: {node_rule.threshold_value} min)."
+                        f"El nodo no ha transmitido uplinks durante {elapsed_str} "
+                        f"(umbral configurado: {thresh_str})."
                     ),
-                    observed_value=f"Sin actividad durante {mins} min",
-                    threshold_formatted=f"{node_rule.threshold_value} min",
+                    observed_value=f"Sin actividad durante {elapsed_str}",
+                    threshold_formatted=thresh_str,
                     last_activity_at=raw["last_seen_at"],
                     now=now,
                 )
-            elif state == "ACTIVE":
+            elif state == "ACTIVE" or not inact_enabled:
                 alarm_engine.resolve_if_recovered(
                     "NODE_SILENT", "NODE", raw["dev_eui"], "Comunicación de nodo restablecida", now
                 )
@@ -294,8 +365,8 @@ class RuntimeStore:
             bat_val = raw["battery_level"]
             if (
                 bat_val is not None
-                and bat_rule.is_enabled
-                and bat_val <= bat_rule.threshold_value
+                and bat_enabled
+                and bat_val <= bat_thresh
             ):
                 alarm_engine.trigger_or_update(
                     rule_code="LOW_BATTERY",
@@ -306,16 +377,16 @@ class RuntimeStore:
                     title="Batería en nivel crítico",
                     condition_description=(
                         f"El nivel energético reportado por el nodo es {int(bat_val)}%, "
-                        f"inferior al umbral operativo de {bat_rule.threshold_value}%."
+                        f"inferior al umbral operativo de {bat_thresh}%."
                     ),
                     observed_value=f"Batería {int(bat_val)}%",
-                    threshold_formatted=f"{bat_rule.threshold_value}%",
+                    threshold_formatted=f"{bat_thresh}%",
                     last_activity_at=raw["last_seen_at"],
                     now=now,
                 )
-            elif bat_val is not None and bat_val > bat_rule.threshold_value:
+            elif (bat_val is not None and bat_val > bat_thresh) or not bat_enabled:
                 alarm_engine.resolve_if_recovered(
-                    "LOW_BATTERY", "NODE", raw["dev_eui"], f"Batería recuperada a {int(bat_val)}%", now
+                    "LOW_BATTERY", "NODE", raw["dev_eui"], f"Batería recuperada a {int(bat_val or 0)}%", now
                 )
 
             # Verificar si el nodo tiene alarmas activas asociadas
@@ -342,6 +413,7 @@ class RuntimeStore:
                     state_criteria=criteria,
                     last_seen_at=raw["last_seen_at"],
                     minutes_since_last_seen=mins,
+                    seconds_since_last_seen=secs_since,
                     battery_level=raw["battery_level"],
                     battery_display=bat_display,
                     location_available=has_loc,
@@ -358,16 +430,42 @@ class RuntimeStore:
         gateways_dto: List[GatewayMetadataDTO] = []
         for gw in self.raw_gateways:
             gw_id = gw["gateway_id"]
+            gw_id_lower = gw_id.lower()
             if gw_id in self.custom_locations:
                 gw["latitude"] = self.custom_locations[gw_id].get("latitude")
                 gw["longitude"] = self.custom_locations[gw_id].get("longitude")
+            elif gw_id_lower in self.custom_locations:
+                gw["latitude"] = self.custom_locations[gw_id_lower].get("latitude")
+                gw["longitude"] = self.custom_locations[gw_id_lower].get("longitude")
+
+            gw_cfg = self.gw_alerts.get(gw_id_lower) or self.gw_alerts.get(gw_id)
+            if gw_cfg:
+                gw_enabled = bool(gw_cfg.get("offline_enabled", gw_rule.is_enabled))
+                gw_val = int(gw_cfg.get("offline_seconds", 900))
+                gw_unit = "seconds"
+            else:
+                gw_enabled = gw_rule.is_enabled
+                gw_val = gw_rule.threshold_value
+                gw_unit = getattr(gw_rule, "unit", "minutes") or "minutes"
 
             state, label, criteria, mins = evaluate_communication_state(
-                gw["last_seen_at"], gw_rule.threshold_value, now
+                gw["last_seen_at"], gw_val, now, unit=gw_unit
+            )
+            gw_secs_since = (
+                int(max(0.0, (now - gw["last_seen_at"]).total_seconds()))
+                if gw.get("last_seen_at")
+                else None
             )
             has_loc, loc_display = format_location(gw["latitude"], gw["longitude"])
 
-            if state == "NO_COMMUNICATION" and gw_rule.is_enabled and mins is not None:
+            if state == "NO_COMMUNICATION" and gw_enabled and mins is not None:
+                if gw_unit == "seconds":
+                    gw_elapsed_str = f"{gw_secs_since if gw_secs_since is not None else mins * 60}s"
+                    gw_thresh_str = f"{gw_val}s"
+                else:
+                    gw_elapsed_str = f"{mins} min"
+                    gw_thresh_str = f"{gw_val} min"
+
                 alarm_engine.trigger_or_update(
                     rule_code="GATEWAY_OFFLINE",
                     severity=gw_rule.severity,
@@ -376,15 +474,15 @@ class RuntimeStore:
                     entity_name=gw["name"],
                     title="Gateway sin comunicación",
                     condition_description=(
-                        f"El gateway no ha reportado estado operativo durante {mins} minutos "
-                        f"(umbral configurado: {gw_rule.threshold_value} min)."
+                        f"El gateway no ha reportado estado operativo durante {gw_elapsed_str} "
+                        f"(umbral configurado: {gw_thresh_str})."
                     ),
-                    observed_value=f"Inactivo hace {mins} min",
-                    threshold_formatted=f"{gw_rule.threshold_value} min",
+                    observed_value=f"Inactivo hace {gw_elapsed_str}",
+                    threshold_formatted=gw_thresh_str,
                     last_activity_at=gw["last_seen_at"],
                     now=now,
                 )
-            elif state == "ACTIVE":
+            elif state == "ACTIVE" or not gw_enabled:
                 alarm_engine.resolve_if_recovered(
                     "GATEWAY_OFFLINE", "GATEWAY", gw["gateway_id"], "Gateway nuevamente en línea", now
                 )
@@ -406,6 +504,7 @@ class RuntimeStore:
                     state_criteria=criteria,
                     last_seen_at=gw["last_seen_at"],
                     minutes_since_last_seen=mins,
+                    seconds_since_last_seen=gw_secs_since,
                     location_available=has_loc,
                     latitude=gw["latitude"] if has_loc else None,
                     longitude=gw["longitude"] if has_loc else None,
@@ -457,6 +556,32 @@ def save_users(users: Dict[str, Dict[str, Any]]) -> None:
 USERS_DB = load_users()
 
 
+def verify_and_upgrade_password(user: Dict[str, Any], plain_password: str) -> bool:
+    """
+    Verifica la contraseña usando bcrypt (password_hash) o SHA-256 legacy (password_sha256).
+    Si coincide con un hash SHA-256 legacy, migra automáticamente a bcrypt con salt.
+    """
+    bcrypt_hash = user.get("password_hash")
+    if bcrypt_hash:
+        try:
+            if verify_password(plain_password, bcrypt_hash):
+                return True
+        except Exception:
+            pass
+
+    legacy_sha = user.get("password_sha256")
+    if legacy_sha:
+        digest = hashlib.sha256(plain_password.encode()).hexdigest()
+        if hmac.compare_digest(legacy_sha, digest):
+            try:
+                user["password_hash"] = hash_password(plain_password)
+                save_users(USERS_DB)
+            except Exception:
+                pass
+            return True
+    return False
+
+
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, str]:
     try:
         payload = jwt.decode(
@@ -470,11 +595,19 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión expirada") from exc
 
 
+def require_admin(current_user: Dict[str, str] = Depends(get_current_user)) -> Dict[str, str]:
+    if current_user.get("role") != "Administrador LoRaWAN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta acción requiere permisos de Administrador LoRaWAN",
+        )
+    return current_user
+
+
 @app.post("/auth/login", response_model=TokenResponse)
 async def login(req: LoginRequest) -> TokenResponse:
     user = USERS_DB.get(req.username.strip().lower())
-    digest = hashlib.sha256(req.password.encode()).hexdigest()
-    if not user or not hmac.compare_digest(user["password_sha256"], digest):
+    if not user or not verify_and_upgrade_password(user, req.password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas")
 
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_access_token_expire_minutes)
@@ -507,14 +640,8 @@ async def list_users(_: Dict = Depends(get_current_user)) -> List[UserResponseDT
 @app.post("/api/users", response_model=UserResponseDTO, status_code=status.HTTP_201_CREATED)
 async def create_user(
     req: UserCreateRequest,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(require_admin),
 ) -> UserResponseDTO:
-    if current_user.get("role") != "Administrador LoRaWAN":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Solo administradores pueden crear nuevos usuarios",
-        )
-
     clean_username = req.username.strip().lower()
     if clean_username in USERS_DB:
         raise HTTPException(
@@ -522,32 +649,26 @@ async def create_user(
             detail=f"El nombre de usuario '{clean_username}' ya existe",
         )
 
-    hashed_pw = hashlib.sha256(req.password.encode()).hexdigest()
+    hashed_sha = hashlib.sha256(req.password.encode()).hexdigest()
+    try:
+        hashed_bcrypt = hash_password(req.password)
+    except Exception:
+        hashed_bcrypt = ""
     created_now = datetime.now(timezone.utc).isoformat()
 
     new_user = {
         "username": clean_username,
         "full_name": req.full_name.strip(),
         "role": req.role.strip(),
-        "password_sha256": hashed_pw,
+        "password_hash": hashed_bcrypt,
+        "password_sha256": hashed_sha,
         "created_at": created_now,
     }
     USERS_DB[clean_username] = new_user
     save_users(USERS_DB)
 
     # Inicializar preferencias de notificaciones por defecto
-    store.user_prefs[clean_username] = NotificationPreferencesDTO(
-        push_enabled=True,
-        notify_critical=True,
-        notify_high=True,
-        notify_medium=True,
-        notify_low=False,
-        notify_node_silent=True,
-        notify_gateway_offline=True,
-        notify_low_battery=True,
-        notify_chirpstack_loss=True,
-        notify_recovery=True,
-    )
+    store.get_user_prefs(clean_username)
 
     logger.info("Usuario creado: %s por %s", clean_username, current_user.get("username"))
     return UserResponseDTO(
@@ -575,6 +696,10 @@ async def change_user_password(
         )
 
     USERS_DB[clean_username]["password_sha256"] = hashlib.sha256(req.new_password.encode()).hexdigest()
+    try:
+        USERS_DB[clean_username]["password_hash"] = hash_password(req.new_password)
+    except Exception:
+        pass
     save_users(USERS_DB)
     logger.info("Contraseña actualizada para usuario: %s", clean_username)
     return {"message": f"Contraseña actualizada exitosamente para '{clean_username}'"}
@@ -861,7 +986,7 @@ async def create_tenant(
 
 
 @app.delete("/api/tenants/{tenant_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_tenant(tenant_id: str, _: Dict = Depends(get_current_user)) -> None:
+async def delete_tenant(tenant_id: str, _: Dict = Depends(require_admin)) -> None:
     try:
         await chirpstack_client.delete_tenant(tenant_id)
         await store.sync_from_chirpstack()
@@ -900,7 +1025,7 @@ async def create_application(
 
 
 @app.delete("/api/applications/{application_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_application(application_id: str, _: Dict = Depends(get_current_user)) -> None:
+async def delete_application(application_id: str, _: Dict = Depends(require_admin)) -> None:
     try:
         await chirpstack_client.delete_application(application_id)
         await store.sync_from_chirpstack()
@@ -1286,7 +1411,7 @@ async def list_operational_events(
 
 @app.get("/api/preferences/notifications", response_model=NotificationPreferencesDTO)
 async def get_notification_preferences(user: Dict = Depends(get_current_user)) -> NotificationPreferencesDTO:
-    return store.user_prefs[user["username"]]
+    return store.get_user_prefs(user["username"])
 
 
 @app.put("/api/preferences/notifications", response_model=NotificationPreferencesDTO)
@@ -1307,6 +1432,7 @@ async def update_rule(
     code: str, rule: AlarmRuleUpdateDTO, _: Dict = Depends(get_current_user)
 ) -> AlarmRuleUpdateDTO:
     store.rules[code] = rule
+    store._save_rules()
     store.evaluate_all()
     return rule
 
@@ -1355,11 +1481,25 @@ async def remove_push_token(
 
 
 @app.websocket("/ws/updates")
-async def websocket_updates(websocket: WebSocket) -> None:
+async def websocket_updates(websocket: WebSocket, token: Optional[str] = Query(default=None)) -> None:
+    if token:
+        try:
+            payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+            if not payload.get("sub") or payload.get("sub") not in USERS_DB:
+                await websocket.close(code=1008)
+                return
+        except JWTError:
+            await websocket.close(code=1008)
+            return
     await websocket.accept()
     store.ws_clients.append(websocket)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        store.ws_clients.remove(websocket)
+        pass
+    except Exception:
+        pass
+    finally:
+        if websocket in store.ws_clients:
+            store.ws_clients.remove(websocket)

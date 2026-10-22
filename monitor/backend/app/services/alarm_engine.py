@@ -26,6 +26,7 @@ class OperationalAlarmEngine:
         self.active_alarms: Dict[Tuple[str, EntityType, str], AlarmDTO] = {}
         # Silenciamiento temporal tras reconocer alarma: (rule_code, entity_type, entity_id) -> datetime (UTC)
         self.silenced_until: Dict[Tuple[str, EntityType, str], datetime] = {}
+        self.silenced_alarms: Dict[Tuple[str, EntityType, str], AlarmDTO] = {}
         self.resolved_alarms: List[AlarmDTO] = []
         self.events: List[OperationalEventDTO] = []
 
@@ -45,6 +46,7 @@ class OperationalAlarmEngine:
             return True
         # Expiró la ventana de 20 minutos: limpiar para permitir nueva evaluación
         self.silenced_until.pop(key, None)
+        self.silenced_alarms.pop(key, None)
         return False
 
     def trigger_or_update(
@@ -136,7 +138,7 @@ class OperationalAlarmEngine:
         key = (rule_code, entity_type, entity_id)
         # Si el nodo se recupera, limpiar cualquier silenciamiento activo
         self.silenced_until.pop(key, None)
-        alarm = self.active_alarms.pop(key, None)
+        alarm = self.active_alarms.pop(key, None) or self.silenced_alarms.pop(key, None)
         if not alarm:
             return None
 
@@ -167,6 +169,7 @@ class OperationalAlarmEngine:
                     if alarm.rule_code == "NODE_SILENT":
                         # Silenciar y ocultar esta alarma específica de dispositivo inactivo durante 20 minutos
                         self.silenced_until[key] = current_time + timedelta(minutes=NODE_SILENT_SNOOZE_MINUTES)
+                        self.silenced_alarms[key] = alarm
                         self.active_alarms.pop(key, None)
                         self._record_event(
                             entity_type=alarm.entity_type,

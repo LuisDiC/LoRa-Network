@@ -1,8 +1,1 @@
-{
-  "24e124126e219784": {
-    "inactivity_seconds": 45,
-    "inactivity_enabled": true,
-    "low_battery_threshold": 20,
-    "low_battery_enabled": true
-  }
-}
+{}
