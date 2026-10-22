@@ -1,0 +1,34 @@
+{
+  "NODE_SILENT": {
+    "code": "NODE_SILENT",
+    "severity": "CRITICAL",
+    "threshold_value": 45,
+    "unit": "seconds",
+    "tolerance_minutes": 0,
+    "is_enabled": true
+  },
+  "GATEWAY_OFFLINE": {
+    "code": "GATEWAY_OFFLINE",
+    "severity": "HIGH",
+    "threshold_value": 15,
+    "unit": "minutes",
+    "tolerance_minutes": 2,
+    "is_enabled": true
+  },
+  "LOW_BATTERY": {
+    "code": "LOW_BATTERY",
+    "severity": "HIGH",
+    "threshold_value": 15,
+    "unit": "%",
+    "tolerance_minutes": 0,
+    "is_enabled": true
+  },
+  "CHIRPSTACK_DISCONNECTED": {
+    "code": "CHIRPSTACK_DISCONNECTED",
+    "severity": "CRITICAL",
+    "threshold_value": 1,
+    "unit": "minutes",
+    "tolerance_minutes": 0,
+    "is_enabled": true
+  }
+}

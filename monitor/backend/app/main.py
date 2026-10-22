@@ -17,15 +17,30 @@ from app.config import settings
 from app.schemas import (
     AlarmDTO,
     AlarmRuleUpdateDTO,
+    ApplicationCreateRequest,
     ApplicationDTO,
+    ApplicationUpdateRequest,
     DashboardSummaryDTO,
+    DeviceCreateRequest,
+    DeviceProfileCreateRequest,
+    DeviceProfileDTO,
+    DeviceProfileUpdateRequest,
+    DeviceUpdateRequest,
+    GatewayAlertConfigDTO,
+    GatewayAlertConfigUpdateDTO,
+    GatewayCreateRequest,
     GatewayMetadataDTO,
+    GatewayUpdateRequest,
     LocationUpdateRequest,
     LoginRequest,
+    NodeAlertConfigDTO,
+    NodeAlertConfigUpdateDTO,
     NodeMetadataDTO,
     NotificationPreferencesDTO,
     OperationalEventDTO,
+    TenantCreateRequest,
     TenantDTO,
+    TenantUpdateRequest,
     TokenResponse,
     UserCreateRequest,
     UserPasswordChangeRequest,
@@ -118,6 +133,10 @@ class RuntimeStore:
         }
         self.custom_locations_file = Path("data/custom_locations.json")
         self.custom_locations: Dict[str, Dict[str, float]] = self._load_custom_locations()
+        self.node_alerts_file = Path("data/node_alerts.json")
+        self.gw_alerts_file = Path("data/gateway_alerts.json")
+        self.node_alerts: Dict[str, Dict[str, Any]] = self._load_node_alerts()
+        self.gw_alerts: Dict[str, Dict[str, Any]] = self._load_gw_alerts()
         self.tenants: List[Dict] = []
         self.applications: List[Dict] = []
         self.raw_nodes: List[Dict] = []
@@ -141,6 +160,40 @@ class RuntimeStore:
                 json.dump(self.custom_locations, f, indent=2)
         except Exception as e:
             logger.error("Error guardando custom_locations.json: %s", e)
+
+    def _load_node_alerts(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            if self.node_alerts_file.exists():
+                with open(self.node_alerts_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning("No se pudo cargar node_alerts.json: %s", e)
+        return {}
+
+    def _save_node_alerts(self) -> None:
+        try:
+            self.node_alerts_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.node_alerts_file, "w", encoding="utf-8") as f:
+                json.dump(self.node_alerts, f, indent=2)
+        except Exception as e:
+            logger.error("Error guardando node_alerts.json: %s", e)
+
+    def _load_gw_alerts(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            if self.gw_alerts_file.exists():
+                with open(self.gw_alerts_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning("No se pudo cargar gateway_alerts.json: %s", e)
+        return {}
+
+    def _save_gw_alerts(self) -> None:
+        try:
+            self.gw_alerts_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.gw_alerts_file, "w", encoding="utf-8") as f:
+                json.dump(self.gw_alerts, f, indent=2)
+        except Exception as e:
+            logger.error("Error guardando gateway_alerts.json: %s", e)
 
     async def sync_from_chirpstack(self) -> bool:
         if not settings.chirpstack_api_token:
@@ -554,6 +607,7 @@ async def delete_user(
 
 
 @app.get("/api/dashboard", response_model=DashboardSummaryDTO)
+@app.get("/api/dashboard/summary", response_model=DashboardSummaryDTO)
 async def get_dashboard(_: Dict = Depends(get_current_user)) -> DashboardSummaryDTO:
     nodes, gateways = store.evaluate_all()
     now = datetime.now(timezone.utc)
@@ -600,6 +654,438 @@ async def trigger_manual_sync(_: Dict = Depends(get_current_user)) -> Dict[str, 
         "gateways_count": len(store.raw_gateways),
         "last_sync_at": store.last_sync_at,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD: NODOS / DISPOSITIVOS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/nodes", response_model=NodeMetadataDTO, status_code=status.HTTP_201_CREATED)
+@app.post("/api/devices", response_model=NodeMetadataDTO, status_code=status.HTTP_201_CREATED)
+async def create_node(
+    req: DeviceCreateRequest,
+    _: Dict = Depends(get_current_user),
+) -> NodeMetadataDTO:
+    clean_eui = req.dev_eui.strip().lower()
+    try:
+        await chirpstack_client.create_device(req.model_dump())
+        if req.latitude is not None and req.longitude is not None:
+            store.custom_locations[clean_eui] = {"latitude": req.latitude, "longitude": req.longitude}
+            store._save_custom_locations()
+        await store.sync_from_chirpstack()
+        nodes, _ = store.evaluate_all()
+        for node in nodes:
+            if node.dev_eui.lower() == clean_eui:
+                return node
+        has_loc = req.latitude is not None and req.longitude is not None
+        return NodeMetadataDTO(
+            dev_eui=clean_eui,
+            name=req.name,
+            application_id=req.application_id,
+            application_name="Aplicación",
+            tenant_id="",
+            tenant_name="",
+            communication_state="UNKNOWN",
+            state_label="Estado desconocido",
+            state_criteria="Recién registrado",
+            battery_display="No disponible",
+            location_available=has_loc,
+            latitude=req.latitude,
+            longitude=req.longitude,
+            location_display=f"{req.latitude:.5f}, {req.longitude:.5f}" if has_loc else "No disponible",
+            registered_display="Recién registrado",
+            has_active_alarm=False,
+        )
+    except Exception as exc:
+        logger.error("Error creando dispositivo en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.put("/api/nodes/{dev_eui}", response_model=NodeMetadataDTO)
+@app.put("/api/devices/{dev_eui}", response_model=NodeMetadataDTO)
+async def update_node(
+    dev_eui: str,
+    req: DeviceUpdateRequest,
+    _: Dict = Depends(get_current_user),
+) -> NodeMetadataDTO:
+    clean_eui = dev_eui.strip().lower()
+    try:
+        await chirpstack_client.update_device(clean_eui, req.model_dump())
+        await store.sync_from_chirpstack()
+        nodes, _ = store.evaluate_all()
+        for node in nodes:
+            if node.dev_eui.lower() == clean_eui:
+                return node
+        raise HTTPException(status_code=404, detail="Nodo no encontrado")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Error actualizando dispositivo en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/nodes/{dev_eui}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/api/devices/{dev_eui}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_node(
+    dev_eui: str,
+    _: Dict = Depends(get_current_user),
+) -> None:
+    clean_eui = dev_eui.strip().lower()
+    try:
+        await chirpstack_client.delete_device(clean_eui)
+        if clean_eui in store.custom_locations:
+            del store.custom_locations[clean_eui]
+            store._save_custom_locations()
+        if clean_eui in store.node_alerts:
+            del store.node_alerts[clean_eui]
+            store._save_node_alerts()
+        await store.sync_from_chirpstack()
+    except Exception as exc:
+        logger.error("Error eliminando dispositivo en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD: GATEWAYS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/gateways", response_model=GatewayMetadataDTO, status_code=status.HTTP_201_CREATED)
+async def create_gateway(
+    req: GatewayCreateRequest,
+    _: Dict = Depends(get_current_user),
+) -> GatewayMetadataDTO:
+    clean_id = req.gateway_id.strip().lower()
+    try:
+        await chirpstack_client.create_gateway(req.model_dump())
+        if req.latitude is not None and req.longitude is not None:
+            store.custom_locations[clean_id] = {"latitude": req.latitude, "longitude": req.longitude}
+            store._save_custom_locations()
+        await store.sync_from_chirpstack()
+        _, gateways = store.evaluate_all()
+        for gw in gateways:
+            if gw.gateway_id.lower() == clean_id:
+                return gw
+        return GatewayMetadataDTO(
+            gateway_id=clean_id,
+            name=req.name,
+            tenant_id=req.tenant_id,
+            tenant_name="Tenant",
+            communication_state="UNKNOWN",
+            state_label="Estado desconocido",
+            state_criteria="Recién registrado",
+            location_available=bool(req.latitude and req.longitude),
+            latitude=req.latitude,
+            longitude=req.longitude,
+            location_display=f"{req.latitude:.5f}, {req.longitude:.5f}" if req.latitude and req.longitude else "No disponible",
+            has_active_alarm=False,
+        )
+    except Exception as exc:
+        logger.error("Error creando gateway en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.put("/api/gateways/{gateway_id}", response_model=GatewayMetadataDTO)
+async def update_gateway(
+    gateway_id: str,
+    req: GatewayUpdateRequest,
+    _: Dict = Depends(get_current_user),
+) -> GatewayMetadataDTO:
+    clean_id = gateway_id.strip().lower()
+    try:
+        await chirpstack_client.update_gateway(clean_id, req.model_dump())
+        if req.latitude is not None and req.longitude is not None:
+            store.custom_locations[clean_id] = {"latitude": req.latitude, "longitude": req.longitude}
+            store._save_custom_locations()
+        await store.sync_from_chirpstack()
+        _, gateways = store.evaluate_all()
+        for gw in gateways:
+            if gw.gateway_id.lower() == clean_id:
+                return gw
+        raise HTTPException(status_code=404, detail="Gateway no encontrado")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Error actualizando gateway en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/gateways/{gateway_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_gateway(
+    gateway_id: str,
+    _: Dict = Depends(get_current_user),
+) -> None:
+    clean_id = gateway_id.strip().lower()
+    try:
+        await chirpstack_client.delete_gateway(clean_id)
+        if clean_id in store.custom_locations:
+            del store.custom_locations[clean_id]
+            store._save_custom_locations()
+        if clean_id in store.gw_alerts:
+            del store.gw_alerts[clean_id]
+            store._save_gw_alerts()
+        await store.sync_from_chirpstack()
+    except Exception as exc:
+        logger.error("Error eliminando gateway en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD: TENANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/tenants", response_model=TenantDTO, status_code=status.HTTP_201_CREATED)
+async def create_tenant(
+    req: TenantCreateRequest,
+    _: Dict = Depends(get_current_user),
+) -> TenantDTO:
+    try:
+        tid = await chirpstack_client.create_tenant(req.model_dump())
+        await store.sync_from_chirpstack()
+        for t in store.tenants:
+            if t["tenant_id"] == tid:
+                return TenantDTO(
+                    tenant_id=t["tenant_id"],
+                    name=t["name"],
+                    description=t.get("description", ""),
+                    can_have_gateways=t.get("can_have_gateways", True),
+                    max_device_count=t.get("max_device_count", 0),
+                    max_gateway_count=t.get("max_gateway_count", 0),
+                    applications_count=0,
+                    nodes_count=0,
+                    gateways_count=0,
+                )
+        return TenantDTO(tenant_id=tid, name=req.name, description=req.description or "", applications_count=0, nodes_count=0, gateways_count=0)
+    except Exception as exc:
+        logger.error("Error creando tenant en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/tenants/{tenant_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_tenant(tenant_id: str, _: Dict = Depends(get_current_user)) -> None:
+    try:
+        await chirpstack_client.delete_tenant(tenant_id)
+        await store.sync_from_chirpstack()
+    except Exception as exc:
+        logger.error("Error eliminando tenant en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD: APLICACIONES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/applications", response_model=ApplicationDTO, status_code=status.HTTP_201_CREATED)
+async def create_application(
+    req: ApplicationCreateRequest,
+    _: Dict = Depends(get_current_user),
+) -> ApplicationDTO:
+    try:
+        aid = await chirpstack_client.create_application(req.model_dump())
+        await store.sync_from_chirpstack()
+        for a in store.applications:
+            if a["application_id"] == aid:
+                return ApplicationDTO(
+                    application_id=a["application_id"],
+                    name=a["name"],
+                    description=a.get("description", ""),
+                    tenant_id=a["tenant_id"],
+                    tenant_name=a.get("tenant_name", "Tenant"),
+                    nodes_count=0,
+                    active_nodes_count=0,
+                )
+        return ApplicationDTO(application_id=aid, name=req.name, description=req.description or "", tenant_id=req.tenant_id, tenant_name="Tenant", nodes_count=0, active_nodes_count=0)
+    except Exception as exc:
+        logger.error("Error creando aplicación en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/applications/{application_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_application(application_id: str, _: Dict = Depends(get_current_user)) -> None:
+    try:
+        await chirpstack_client.delete_application(application_id)
+        await store.sync_from_chirpstack()
+    except Exception as exc:
+        logger.error("Error eliminando aplicación en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRUD: DEVICE PROFILES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/device-profiles", response_model=List[DeviceProfileDTO])
+async def list_device_profiles(
+    tenant_id: Optional[str] = Query(default=None),
+    include_vendors: bool = Query(default=True),
+    _: Dict = Depends(get_current_user),
+) -> List[DeviceProfileDTO]:
+    raw_list = await chirpstack_client.fetch_device_profiles(tenant_id, include_vendors=include_vendors)
+    tenant_map = {t["tenant_id"]: t["name"] for t in store.tenants}
+    return [
+        DeviceProfileDTO(
+            id=p["id"],
+            tenant_id=p["tenant_id"],
+            tenant_name=tenant_map.get(p["tenant_id"], p.get("vendor_name") or "Global / Vendor") if p["tenant_id"] else (p.get("vendor_name") or "Global / Vendor"),
+            name=p["name"],
+            description=p.get("description", ""),
+            region=p.get("region", "US915"),
+            region_config_id=p.get("region_config_id", ""),
+            mac_version=p.get("mac_version", "LORAWAN_1_0_3"),
+            reg_params_revision=p.get("reg_params_revision", "A"),
+            supports_otaa=p.get("supports_otaa", True),
+            supports_class_b=p.get("supports_class_b", False),
+            supports_class_c=p.get("supports_class_c", False),
+            uplink_interval=int(p.get("uplink_interval", 3600)),
+            payload_codec_runtime=p.get("payload_codec_runtime", "NONE"),
+            payload_codec_script=p.get("payload_codec_script", ""),
+            vendor_id=p.get("vendor_id", ""),
+            vendor_name=p.get("vendor_name", ""),
+            device_id=p.get("device_id", ""),
+            device_name=p.get("device_name", ""),
+            firmware_version=p.get("firmware_version", ""),
+            is_tenant_profile=bool(p.get("is_tenant_profile", bool(p["tenant_id"]))),
+            created_at=p.get("created_at"),
+            updated_at=p.get("updated_at"),
+        )
+        for p in raw_list
+    ]
+
+
+@app.post("/api/device-profiles", response_model=DeviceProfileDTO, status_code=status.HTTP_201_CREATED)
+async def create_device_profile(
+    req: DeviceProfileCreateRequest,
+    _: Dict = Depends(get_current_user),
+) -> DeviceProfileDTO:
+    try:
+        pid = await chirpstack_client.create_device_profile(req.model_dump())
+        tenant_map = {t["tenant_id"]: t["name"] for t in store.tenants}
+        return DeviceProfileDTO(
+            id=pid,
+            tenant_id=req.tenant_id,
+            tenant_name=tenant_map.get(req.tenant_id, "Tenant"),
+            name=req.name,
+            description=req.description or "",
+            region=req.region,
+            region_config_id=req.region_config_id or "",
+            mac_version=req.mac_version,
+            reg_params_revision=req.reg_params_revision,
+            supports_otaa=req.supports_otaa,
+            supports_class_b=req.supports_class_b,
+            supports_class_c=req.supports_class_c,
+            uplink_interval=req.uplink_interval,
+            payload_codec_runtime=req.payload_codec_runtime,
+            payload_codec_script=req.payload_codec_script or "",
+        )
+    except Exception as exc:
+        logger.error("Error creando perfil de dispositivo en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/device-profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_device_profile(profile_id: str, _: Dict = Depends(get_current_user)) -> None:
+    try:
+        await chirpstack_client.delete_device_profile(profile_id)
+    except Exception as exc:
+        logger.error("Error eliminando perfil de dispositivo en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ALERTAS PERSONALIZADAS POR NODO Y GATEWAY
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/nodes/{dev_eui}/alerts", response_model=NodeAlertConfigDTO)
+async def get_node_alerts(dev_eui: str, _: Dict = Depends(get_current_user)) -> NodeAlertConfigDTO:
+    clean_eui = dev_eui.strip().lower()
+    cfg = store.node_alerts.get(clean_eui) or {}
+    default_thresh = store.rules.get("NODE_SILENT")
+    default_sec = default_thresh.threshold_value if default_thresh else 60
+    default_bat = store.rules.get("LOW_BATTERY")
+    default_bat_val = default_bat.threshold_value if default_bat else 15
+
+    return NodeAlertConfigDTO(
+        dev_eui=clean_eui,
+        inactivity_seconds=cfg.get("inactivity_seconds", default_sec),
+        inactivity_enabled=cfg.get("inactivity_enabled", True),
+        low_battery_threshold=cfg.get("low_battery_threshold", default_bat_val),
+        low_battery_enabled=cfg.get("low_battery_enabled", True),
+    )
+
+
+@app.put("/api/nodes/{dev_eui}/alerts", response_model=NodeAlertConfigDTO)
+async def update_node_alerts(
+    dev_eui: str,
+    req: NodeAlertConfigUpdateDTO,
+    _: Dict = Depends(get_current_user),
+) -> NodeAlertConfigDTO:
+    clean_eui = dev_eui.strip().lower()
+    current = store.node_alerts.get(clean_eui) or {
+        "inactivity_seconds": 60,
+        "inactivity_enabled": True,
+        "low_battery_threshold": 15,
+        "low_battery_enabled": True,
+    }
+    if req.inactivity_seconds is not None:
+        current["inactivity_seconds"] = req.inactivity_seconds
+    if req.inactivity_enabled is not None:
+        current["inactivity_enabled"] = req.inactivity_enabled
+    if req.low_battery_threshold is not None:
+        current["low_battery_threshold"] = req.low_battery_threshold
+    if req.low_battery_enabled is not None:
+        current["low_battery_enabled"] = req.low_battery_enabled
+
+    store.node_alerts[clean_eui] = current
+    store._save_node_alerts()
+    store.evaluate_all()
+
+    return NodeAlertConfigDTO(
+        dev_eui=clean_eui,
+        inactivity_seconds=current["inactivity_seconds"],
+        inactivity_enabled=current["inactivity_enabled"],
+        low_battery_threshold=current["low_battery_threshold"],
+        low_battery_enabled=current["low_battery_enabled"],
+    )
+
+
+@app.get("/api/gateways/{gateway_id}/alerts", response_model=GatewayAlertConfigDTO)
+async def get_gateway_alerts(gateway_id: str, _: Dict = Depends(get_current_user)) -> GatewayAlertConfigDTO:
+    clean_id = gateway_id.strip().lower()
+    cfg = store.gw_alerts.get(clean_id) or {}
+    default_gw = store.rules.get("GATEWAY_OFFLINE")
+    default_sec = (default_gw.threshold_value * 60) if default_gw else 900
+
+    return GatewayAlertConfigDTO(
+        gateway_id=clean_id,
+        offline_seconds=cfg.get("offline_seconds", default_sec),
+        offline_enabled=cfg.get("offline_enabled", True),
+    )
+
+
+@app.put("/api/gateways/{gateway_id}/alerts", response_model=GatewayAlertConfigDTO)
+async def update_gateway_alerts(
+    gateway_id: str,
+    req: GatewayAlertConfigUpdateDTO,
+    _: Dict = Depends(get_current_user),
+) -> GatewayAlertConfigDTO:
+    clean_id = gateway_id.strip().lower()
+    current = store.gw_alerts.get(clean_id) or {
+        "offline_seconds": 900,
+        "offline_enabled": True,
+    }
+    if req.offline_seconds is not None:
+        current["offline_seconds"] = req.offline_seconds
+    if req.offline_enabled is not None:
+        current["offline_enabled"] = req.offline_enabled
+
+    store.gw_alerts[clean_id] = current
+    store._save_gw_alerts()
+    store.evaluate_all()
+
+    return GatewayAlertConfigDTO(
+        gateway_id=clean_id,
+        offline_seconds=current["offline_seconds"],
+        offline_enabled=current["offline_enabled"],
+    )
 
 
 @app.get("/api/nodes", response_model=List[NodeMetadataDTO])
@@ -751,19 +1237,28 @@ async def list_applications(
 @app.get("/api/alarms", response_model=List[AlarmDTO])
 async def list_alarms(
     status_filter: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
     severity: Optional[str] = Query(default=None),
     _: Dict = Depends(get_current_user),
 ) -> List[AlarmDTO]:
     store.evaluate_all()
-    all_alarms = list(alarm_engine.active_alarms.values()) + alarm_engine.resolved_alarms
-    if status_filter:
-        all_alarms = [a for a in all_alarms if a.status == status_filter]
+    now = datetime.now(timezone.utc)
+    active_visible = [
+        a
+        for a in alarm_engine.active_alarms.values()
+        if not alarm_engine.is_silenced(a.rule_code, a.entity_type, a.entity_id, now)
+    ]
+    all_alarms = active_visible + alarm_engine.resolved_alarms
+    effective_status = (status_filter or status or "").upper()
+    if effective_status:
+        all_alarms = [a for a in all_alarms if a.status.upper() == effective_status]
     if severity:
-        all_alarms = [a for a in all_alarms if a.severity == severity]
+        all_alarms = [a for a in all_alarms if a.severity.upper() == severity.upper()]
     return all_alarms
 
 
 @app.post("/api/alarms/{alarm_id}/ack", response_model=AlarmDTO)
+@app.post("/api/alarms/{alarm_id}/acknowledge", response_model=AlarmDTO)
 async def acknowledge_alarm(alarm_id: str, user: Dict = Depends(get_current_user)) -> AlarmDTO:
     alarm = alarm_engine.acknowledge(alarm_id, user["full_name"])
     if not alarm:

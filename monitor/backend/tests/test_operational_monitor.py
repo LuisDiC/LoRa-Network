@@ -159,3 +159,54 @@ def test_unavailable_metadata_formatting():
     has_coords, loc_text = format_location(None, None)
     assert has_coords is False
     assert loc_text == "No disponible"
+
+
+def test_seconds_based_inactivity_evaluation():
+    now = datetime.now(timezone.utc)
+    threshold_seconds = 45
+
+    # 1. Dispositivo activo (20 segundos transcurridos <= 45s)
+    state_act, _, criteria_act, _ = evaluate_communication_state(
+        now - timedelta(seconds=20), threshold_seconds, now, unit="seconds"
+    )
+    assert state_act == "ACTIVE"
+    assert "20s" in criteria_act
+    assert "≤ 45s" in criteria_act
+
+    # 2. Dispositivo inactivo (60 segundos transcurridos > 45s)
+    past_time = now - timedelta(seconds=60)
+    state_sil, _, criteria_sil, _ = evaluate_communication_state(
+        past_time, threshold_seconds, now, unit="seconds"
+    )
+    assert state_sil == "NO_COMMUNICATION"
+    assert "60s" in criteria_sil
+    assert "45s" in criteria_sil
+    assert past_time.strftime("%Y-%m-%d %H:%M:%S UTC") in criteria_sil
+
+
+def test_alarm_reports_last_activity_timestamp():
+    engine = OperationalAlarmEngine()
+    now = datetime.now(timezone.utc)
+    last_seen = now - timedelta(seconds=90)
+    ts_expected = last_seen.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    alarm, is_new = engine.trigger_or_update(
+        rule_code="NODE_SILENT",
+        severity="CRITICAL",
+        entity_type="NODE",
+        entity_id="24e124746f420431",
+        entity_name="CT-1000A",
+        title="Dispositivo inactivo: CT-1000A",
+        condition_description=f"Inactivo durante 90s. Última comunicación: {ts_expected}.",
+        observed_value=f"Última comunicación: {ts_expected} (hace 90s)",
+        threshold_formatted="60 segundos",
+        last_activity_at=last_seen,
+        now=now,
+    )
+
+    assert is_new is True
+    assert alarm.last_activity_at == last_seen
+    assert alarm.last_activity_timestamp == ts_expected
+    assert ts_expected in alarm.condition_description
+    assert ts_expected in alarm.observed_value
+    assert alarm.age_seconds == 0

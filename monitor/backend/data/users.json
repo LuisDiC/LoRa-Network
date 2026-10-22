@@ -1,1 +1,16 @@
-{}
+{
+  "operador.demo": {
+    "username": "operador.demo",
+    "full_name": "Operador de Red",
+    "role": "Administrador LoRaWAN",
+    "password_sha256": "5487cf596c53bf12e05cec7d9e2b719478cba212eb9e146e927900b48825f872",
+    "created_at": "2024-01-01T00:00:00Z"
+  },
+  "ldcarrillo": {
+    "username": "ldcarrillo",
+    "full_name": "Luis D",
+    "role": "Administrador LoRaWAN",
+    "password_sha256": "157ad0f74b0306a283bb6ec0551daa5334ed8f3ba9f1a15c2150d85ee67cb882",
+    "created_at": "2026-10-22T19:59:51.631877+00:00"
+  }
+}
