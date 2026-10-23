@@ -826,6 +826,38 @@ async def create_node(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.get("/api/nodes/{dev_eui}/config")
+async def get_node_config(
+    dev_eui: str,
+    _: Dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    clean_eui = dev_eui.strip().lower()
+    loc = store.custom_locations.get(clean_eui) or {}
+    try:
+        cfg = await chirpstack_client.get_device(clean_eui)
+        return {
+            **cfg,
+            "latitude": loc.get("latitude"),
+            "longitude": loc.get("longitude"),
+        }
+    except Exception:
+        nodes, _ = store.evaluate_all()
+        for n in nodes:
+            if n.dev_eui.lower() == clean_eui:
+                return {
+                    "dev_eui": n.dev_eui,
+                    "name": n.name,
+                    "description": "",
+                    "application_id": n.application_id,
+                    "device_profile_id": "",
+                    "is_disabled": False,
+                    "skip_fcnt_check": False,
+                    "latitude": n.latitude,
+                    "longitude": n.longitude,
+                }
+        raise HTTPException(status_code=404, detail="Nodo no encontrado")
+
+
 @app.put("/api/nodes/{dev_eui}", response_model=NodeMetadataDTO)
 @app.put("/api/devices/{dev_eui}", response_model=NodeMetadataDTO)
 async def update_node(
@@ -836,6 +868,9 @@ async def update_node(
     clean_eui = dev_eui.strip().lower()
     try:
         await chirpstack_client.update_device(clean_eui, req.model_dump())
+        if req.latitude is not None and req.longitude is not None:
+            store.custom_locations[clean_eui] = {"latitude": req.latitude, "longitude": req.longitude}
+            store._save_custom_locations()
         await store.sync_from_chirpstack()
         nodes, _ = store.evaluate_all()
         for node in nodes:
@@ -909,6 +944,37 @@ async def create_gateway(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.get("/api/gateways/{gateway_id}/config")
+async def get_gateway_config(
+    gateway_id: str,
+    _: Dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    clean_id = gateway_id.strip().lower()
+    loc = store.custom_locations.get(clean_id) or {}
+    try:
+        cfg = await chirpstack_client.get_gateway(clean_id)
+        return {
+            **cfg,
+            "latitude": cfg.get("latitude") if cfg.get("latitude") is not None else loc.get("latitude"),
+            "longitude": cfg.get("longitude") if cfg.get("longitude") is not None else loc.get("longitude"),
+        }
+    except Exception:
+        _, gateways = store.evaluate_all()
+        for g in gateways:
+            if g.gateway_id.lower() == clean_id:
+                return {
+                    "gateway_id": g.gateway_id,
+                    "name": g.name,
+                    "description": "",
+                    "tenant_id": g.tenant_id or "",
+                    "stats_interval": 30,
+                    "latitude": g.latitude,
+                    "longitude": g.longitude,
+                    "altitude": 0.0,
+                }
+        raise HTTPException(status_code=404, detail="Gateway no encontrado")
+
+
 @app.put("/api/gateways/{gateway_id}", response_model=GatewayMetadataDTO)
 async def update_gateway(
     gateway_id: str,
@@ -964,7 +1030,13 @@ async def create_tenant(
     _: Dict = Depends(get_current_user),
 ) -> TenantDTO:
     try:
-        tid = await chirpstack_client.create_tenant(req.model_dump())
+        tid = await chirpstack_client.create_tenant(
+            name=req.name,
+            description=req.description or "",
+            can_have_gateways=req.can_have_gateways,
+            max_device_count=req.max_device_count,
+            max_gateway_count=req.max_gateway_count,
+        )
         await store.sync_from_chirpstack()
         for t in store.tenants:
             if t["tenant_id"] == tid:
@@ -979,9 +1051,65 @@ async def create_tenant(
                     nodes_count=0,
                     gateways_count=0,
                 )
-        return TenantDTO(tenant_id=tid, name=req.name, description=req.description or "", applications_count=0, nodes_count=0, gateways_count=0)
+        return TenantDTO(
+            tenant_id=tid,
+            name=req.name,
+            description=req.description or "",
+            can_have_gateways=req.can_have_gateways,
+            max_device_count=req.max_device_count,
+            max_gateway_count=req.max_gateway_count,
+            applications_count=0,
+            nodes_count=0,
+            gateways_count=0,
+        )
     except Exception as exc:
         logger.error("Error creando tenant en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.put("/api/tenants/{tenant_id}", response_model=TenantDTO)
+async def update_tenant(
+    tenant_id: str,
+    req: TenantUpdateRequest,
+    _: Dict = Depends(get_current_user),
+) -> TenantDTO:
+    try:
+        await chirpstack_client.update_tenant(
+            tenant_id=tenant_id,
+            name=req.name,
+            description=req.description or "",
+            can_have_gateways=req.can_have_gateways,
+            max_device_count=req.max_device_count,
+            max_gateway_count=req.max_gateway_count,
+        )
+        await store.sync_from_chirpstack()
+        nodes, gateways = store.evaluate_all()
+        for t in store.tenants:
+            if t["tenant_id"] == tenant_id:
+                return TenantDTO(
+                    tenant_id=t["tenant_id"],
+                    name=t["name"],
+                    description=t.get("description", ""),
+                    can_have_gateways=t.get("can_have_gateways", True),
+                    max_device_count=t.get("max_device_count", 0),
+                    max_gateway_count=t.get("max_gateway_count", 0),
+                    applications_count=sum(1 for a in store.applications if a["tenant_id"] == tenant_id),
+                    nodes_count=sum(1 for n in nodes if n.tenant_id == tenant_id),
+                    gateways_count=sum(1 for g in gateways if g.tenant_id == tenant_id),
+                )
+        return TenantDTO(
+            tenant_id=tenant_id,
+            name=req.name,
+            description=req.description or "",
+            can_have_gateways=req.can_have_gateways,
+            max_device_count=req.max_device_count,
+            max_gateway_count=req.max_gateway_count,
+            applications_count=0,
+            nodes_count=0,
+            gateways_count=0,
+        )
+    except Exception as exc:
+        logger.error("Error actualizando tenant en ChirpStack: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc))
 
 
@@ -1005,7 +1133,11 @@ async def create_application(
     _: Dict = Depends(get_current_user),
 ) -> ApplicationDTO:
     try:
-        aid = await chirpstack_client.create_application(req.model_dump())
+        aid = await chirpstack_client.create_application(
+            name=req.name,
+            description=req.description or "",
+            tenant_id=req.tenant_id,
+        )
         await store.sync_from_chirpstack()
         for a in store.applications:
             if a["application_id"] == aid:
@@ -1021,6 +1153,37 @@ async def create_application(
         return ApplicationDTO(application_id=aid, name=req.name, description=req.description or "", tenant_id=req.tenant_id, tenant_name="Tenant", nodes_count=0, active_nodes_count=0)
     except Exception as exc:
         logger.error("Error creando aplicación en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.put("/api/applications/{application_id}", response_model=ApplicationDTO)
+async def update_application(
+    application_id: str,
+    req: ApplicationUpdateRequest,
+    _: Dict = Depends(get_current_user),
+) -> ApplicationDTO:
+    try:
+        await chirpstack_client.update_application(
+            application_id=application_id,
+            name=req.name,
+            description=req.description or "",
+        )
+        await store.sync_from_chirpstack()
+        nodes, _ = store.evaluate_all()
+        for a in store.applications:
+            if a["application_id"] == application_id:
+                return ApplicationDTO(
+                    application_id=a["application_id"],
+                    name=a["name"],
+                    description=a.get("description", ""),
+                    tenant_id=a["tenant_id"],
+                    tenant_name=a.get("tenant_name", "Tenant"),
+                    nodes_count=sum(1 for n in nodes if n.application_id == application_id),
+                    active_nodes_count=sum(1 for n in nodes if n.application_id == application_id and n.communication_state == "ACTIVE"),
+                )
+        return ApplicationDTO(application_id=application_id, name=req.name, description=req.description or "", tenant_id="", tenant_name="Tenant", nodes_count=0, active_nodes_count=0)
+    except Exception as exc:
+        logger.error("Error actualizando aplicación en ChirpStack: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc))
 
 
@@ -1103,6 +1266,39 @@ async def create_device_profile(
         )
     except Exception as exc:
         logger.error("Error creando perfil de dispositivo en ChirpStack: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.put("/api/device-profiles/{profile_id}", response_model=DeviceProfileDTO)
+async def update_device_profile(
+    profile_id: str,
+    req: DeviceProfileUpdateRequest,
+    _: Dict = Depends(get_current_user),
+) -> DeviceProfileDTO:
+    try:
+        await chirpstack_client.update_device_profile(profile_id, req.model_dump())
+        dp = await chirpstack_client.get_device_profile(profile_id)
+        tenant_map = {t["tenant_id"]: t["name"] for t in store.tenants}
+        tid = dp.get("tenant_id", "")
+        return DeviceProfileDTO(
+            id=profile_id,
+            tenant_id=tid,
+            tenant_name=tenant_map.get(tid, "Tenant"),
+            name=dp.get("name", req.name),
+            description=dp.get("description", req.description or ""),
+            region=dp.get("region", req.region),
+            region_config_id=dp.get("region_config_id", req.region_config_id or ""),
+            mac_version=dp.get("mac_version", req.mac_version),
+            reg_params_revision=dp.get("reg_params_revision", req.reg_params_revision),
+            supports_otaa=dp.get("supports_otaa", req.supports_otaa),
+            supports_class_b=dp.get("supports_class_b", req.supports_class_b),
+            supports_class_c=dp.get("supports_class_c", req.supports_class_c),
+            uplink_interval=dp.get("uplink_interval", req.uplink_interval),
+            payload_codec_runtime=dp.get("payload_codec_runtime", req.payload_codec_runtime),
+            payload_codec_script=dp.get("payload_codec_script", req.payload_codec_script or ""),
+        )
+    except Exception as exc:
+        logger.error("Error actualizando perfil de dispositivo en ChirpStack: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc))
 
 
@@ -1326,6 +1522,10 @@ async def list_tenants(_: Dict = Depends(get_current_user)) -> List[TenantDTO]:
             TenantDTO(
                 tenant_id=tid,
                 name=t["name"],
+                description=t.get("description", ""),
+                can_have_gateways=t.get("can_have_gateways", True),
+                max_device_count=t.get("max_device_count", 0),
+                max_gateway_count=t.get("max_gateway_count", 0),
                 applications_count=sum(1 for a in store.applications if a["tenant_id"] == tid),
                 nodes_count=sum(1 for n in nodes if n.tenant_id == tid),
                 gateways_count=sum(1 for g in gateways if g.tenant_id == tid),
@@ -1348,6 +1548,7 @@ async def list_applications(
             tenant_id=a["tenant_id"],
             tenant_name=a["tenant_name"],
             name=a["name"],
+            description=a.get("description", ""),
             nodes_count=sum(1 for n in nodes if n.application_id == a["application_id"]),
             active_nodes_count=sum(
                 1

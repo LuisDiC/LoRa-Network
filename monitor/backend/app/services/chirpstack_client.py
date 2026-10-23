@@ -232,16 +232,23 @@ class ChirpStackV4Client:
 
     async def create_tenant(
         self,
-        name: str,
+        name: Any,
         description: str = "",
         can_have_gateways: bool = True,
         max_device_count: int = 0,
         max_gateway_count: int = 0,
     ) -> str:
+        if isinstance(name, dict):
+            data = name
+            name = str(data.get("name", "")).strip()
+            description = str(data.get("description") or "").strip()
+            can_have_gateways = bool(data.get("can_have_gateways", True))
+            max_device_count = int(data.get("max_device_count", 0))
+            max_gateway_count = int(data.get("max_gateway_count", 0))
         payload = {
             "tenant": {
-                "name": name,
-                "description": description,
+                "name": str(name).strip(),
+                "description": description or "",
                 "canHaveGateways": can_have_gateways,
                 "maxDeviceCount": max_device_count,
                 "maxGatewayCount": max_gateway_count,
@@ -255,17 +262,24 @@ class ChirpStackV4Client:
     async def update_tenant(
         self,
         tenant_id: str,
-        name: str,
+        name: Any,
         description: str = "",
         can_have_gateways: bool = True,
         max_device_count: int = 0,
         max_gateway_count: int = 0,
     ) -> None:
+        if isinstance(name, dict):
+            data = name
+            name = str(data.get("name", "")).strip()
+            description = str(data.get("description") or "").strip()
+            can_have_gateways = bool(data.get("can_have_gateways", True))
+            max_device_count = int(data.get("max_device_count", 0))
+            max_gateway_count = int(data.get("max_gateway_count", 0))
         payload = {
             "tenant": {
                 "id": tenant_id,
-                "name": name,
-                "description": description,
+                "name": str(name).strip(),
+                "description": description or "",
                 "canHaveGateways": can_have_gateways,
                 "maxDeviceCount": max_device_count,
                 "maxGatewayCount": max_gateway_count,
@@ -304,24 +318,38 @@ class ChirpStackV4Client:
             "description": app.get("description", ""),
         }
 
-    async def create_application(self, name: str, description: str, tenant_id: str) -> str:
+    async def create_application(
+        self,
+        name: Any,
+        description: str = "",
+        tenant_id: str = "",
+    ) -> str:
+        if isinstance(name, dict):
+            data = name
+            name = str(data.get("name", "")).strip()
+            description = str(data.get("description") or "").strip()
+            tenant_id = str(data.get("tenant_id") or "").strip()
         payload = {
             "application": {
-                "name": name,
-                "description": description,
+                "name": str(name).strip(),
+                "description": description or "",
                 "tenantId": tenant_id,
             }
         }
         res = await self._post("/api/applications", payload)
         return res.get("id", "")
 
-    async def update_application(self, application_id: str, name: str, description: str = "") -> None:
+    async def update_application(self, application_id: str, name: Any, description: str = "") -> None:
+        if isinstance(name, dict):
+            data = name
+            name = str(data.get("name", "")).strip()
+            description = str(data.get("description") or "").strip()
         current = await self.get_application(application_id)
         payload = {
             "application": {
                 "id": application_id,
-                "name": name,
-                "description": description,
+                "name": str(name).strip(),
+                "description": description or "",
                 "tenantId": current["tenant_id"],
             }
         }
@@ -635,6 +663,7 @@ class ChirpStackV4Client:
                 "gatewayId": gateway_id,
                 "name": data["name"].strip(),
                 "description": data.get("description", current.get("description", "")),
+                "tenantId": current.get("tenant_id", ""),
                 "statsInterval": int(data.get("stats_interval", current.get("stats_interval", 30))),
                 "location": loc,
             }
@@ -700,14 +729,18 @@ class ChirpStackV4Client:
             "device": {
                 "devEui": dev_eui,
                 "name": data["name"].strip(),
-                "description": data.get("description", current.get("description", "")),
-                "applicationId": current["application_id"],
-                "deviceProfileId": data.get("device_profile_id", current["device_profile_id"]),
-                "isDisabled": bool(data.get("is_disabled", current["is_disabled"])),
-                "skipFcntCheck": current["skip_fcnt_check"],
+                "description": data.get("description") if data.get("description") is not None else current.get("description", ""),
+                "applicationId": data.get("application_id") or current["application_id"],
+                "deviceProfileId": data.get("device_profile_id") or current["device_profile_id"],
+                "isDisabled": bool(data["is_disabled"]) if data.get("is_disabled") is not None else current["is_disabled"],
+                "skipFcntCheck": bool(data["skip_fcnt_check"]) if data.get("skip_fcnt_check") is not None else current["skip_fcnt_check"],
             }
         }
         await self._put(f"/api/devices/{dev_eui}", payload)
+
+        app_key = data.get("app_key")
+        if app_key and app_key.strip():
+            await self.set_device_keys(dev_eui, app_key.strip().lower())
 
     async def delete_device(self, dev_eui: str) -> None:
         await self._delete(f"/api/devices/{dev_eui}")

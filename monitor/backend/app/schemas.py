@@ -197,6 +197,10 @@ class DeviceUpdateRequest(BaseModel):
     description: Optional[str] = ""
     device_profile_id: Optional[str] = None
     is_disabled: bool = False
+    skip_fcnt_check: bool = False
+    app_key: Optional[str] = Field(None, description="AppKey OTAA opcional de 32 caracteres hex para rotar clave")
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 
 class NodeMetadataDTO(BaseModel):
