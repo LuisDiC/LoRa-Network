@@ -21,6 +21,7 @@ from app.schemas import (
     ApplicationCreateRequest,
     ApplicationDTO,
     ApplicationUpdateRequest,
+    ChirpStackEventLogDTO,
     DashboardSummaryDTO,
     DeviceCreateRequest,
     DeviceProfileCreateRequest,
@@ -34,6 +35,7 @@ from app.schemas import (
     GatewayUpdateRequest,
     LocationUpdateRequest,
     LoginRequest,
+    LoRaWANFrameLogDTO,
     NodeAlertConfigDTO,
     NodeAlertConfigUpdateDTO,
     NodeMetadataDTO,
@@ -51,10 +53,17 @@ from app.services.alarm_engine import OperationalAlarmEngine, SEVERITY_RANK
 from app.services.chirpstack_client import (
     ChirpStackV4Client,
     evaluate_communication_state,
+    evaluate_signal_quality,
     format_battery,
     format_location,
+    parse_chirpstack_mqtt_event,
 )
 from app.services.push_service import PushNotificationService
+
+try:
+    import aiomqtt
+except ImportError:
+    aiomqtt = None  # type: ignore
 
 logger = logging.getLogger("lorawan_monitor.api")
 
@@ -74,9 +83,54 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error("Error en sincronización con ChirpStack: %s", e)
 
+    async def mqtt_listener_loop():
+        if aiomqtt is None:
+            logger.warning("aiomqtt no instalado; suscripción MQTT para Events y LoRa Frames deshabilitada")
+            return
+        while True:
+            try:
+                mqtt_kwargs: Dict[str, Any] = {
+                    "hostname": settings.chirpstack_mqtt_host,
+                    "port": settings.chirpstack_mqtt_port,
+                }
+                if settings.chirpstack_mqtt_username:
+                    mqtt_kwargs["username"] = settings.chirpstack_mqtt_username
+                if settings.chirpstack_mqtt_password:
+                    mqtt_kwargs["password"] = settings.chirpstack_mqtt_password
+
+                async with aiomqtt.Client(**mqtt_kwargs) as client:
+                    await client.subscribe("application/+/device/+/event/+")
+                    await client.subscribe("application/+/device/+/command/+")
+                    await client.subscribe("+/gateway/+/event/+")
+                    await client.subscribe("gateway/+/event/+")
+                    await client.subscribe("+/gateway/+/command/+")
+                    await client.subscribe("gateway/+/command/+")
+                    logger.info(
+                        "Suscrito a MQTT ChirpStack (%s:%d) para captura en vivo de Events, Frames y dBm/dB",
+                        settings.chirpstack_mqtt_host,
+                        settings.chirpstack_mqtt_port,
+                    )
+                    async for message in client.messages:
+                        topic_str = str(message.topic)
+                        payload_bytes = (
+                            message.payload
+                            if isinstance(message.payload, (bytes, bytearray))
+                            else str(message.payload).encode("utf-8", errors="ignore")
+                        )
+                        parsed = parse_chirpstack_mqtt_event(topic_str, bytes(payload_bytes))
+                        if parsed:
+                            await store.ingest_mqtt_event(parsed)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Reconectando listener MQTT de ChirpStack en 5s: %s", e)
+                await asyncio.sleep(5)
+
     sync_task = asyncio.create_task(sync_loop())
+    mqtt_task = asyncio.create_task(mqtt_listener_loop())
     yield
     sync_task.cancel()
+    mqtt_task.cancel()
 
 app = FastAPI(
     title="LoRaWAN Monitor Operational API",
@@ -127,6 +181,11 @@ class RuntimeStore:
         self.gw_alerts_file = Path("data/gateway_alerts.json")
         self.node_alerts: Dict[str, Dict[str, Any]] = self._load_node_alerts()
         self.gw_alerts: Dict[str, Dict[str, Any]] = self._load_gw_alerts()
+        self.rf_logs_file = Path("data/rf_logs.json")
+        self.node_rf_metrics: Dict[str, Dict[str, Any]] = {}
+        self.device_events: List[Dict[str, Any]] = []
+        self.lorawan_frames: List[Dict[str, Any]] = []
+        self._load_rf_logs()
         self.tenants: List[Dict] = []
         self.applications: List[Dict] = []
         self.raw_nodes: List[Dict] = []
@@ -236,6 +295,159 @@ class RuntimeStore:
         except Exception as e:
             logger.error("Error guardando gateway_alerts.json: %s", e)
 
+    def _load_rf_logs(self) -> None:
+        try:
+            if self.rf_logs_file.exists():
+                with open(self.rf_logs_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.node_rf_metrics = data.get("node_rf_metrics", {})
+                        self.device_events = data.get("device_events", [])[:300]
+                        self.lorawan_frames = data.get("lorawan_frames", [])[:300]
+        except Exception as e:
+            logger.warning("No se pudo cargar rf_logs.json: %s", e)
+
+    def _save_rf_logs(self) -> None:
+        try:
+            self.rf_logs_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.rf_logs_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "node_rf_metrics": self.node_rf_metrics,
+                        "device_events": self.device_events[:300],
+                        "lorawan_frames": self.lorawan_frames[:300],
+                    },
+                    f,
+                    default=str,
+                )
+        except Exception as e:
+            logger.error("Error guardando rf_logs.json: %s", e)
+
+    async def ingest_mqtt_event(self, parsed: Dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc)
+        dev_eui = (parsed.get("dev_eui") or "").strip().lower()
+        dev_addr = (parsed.get("dev_addr") or "").strip().lower()
+        gw_id = (parsed.get("gateway_id") or "").strip().lower()
+
+        # Si el frame solo trae DevAddr (p.ej. trama de gateway), buscar DevEUI conocido con ese DevAddr
+        if not dev_eui and dev_addr:
+            for k_eui, rf_data in self.node_rf_metrics.items():
+                if (rf_data.get("dev_addr") or "").lower() == dev_addr:
+                    dev_eui = k_eui
+                    break
+
+        node_name = parsed.get("device_name") or ""
+        app_name = parsed.get("application_name") or ""
+
+        if dev_eui:
+            for n in self.raw_nodes:
+                if n["dev_eui"].lower() == dev_eui:
+                    n["last_seen_at"] = parsed.get("received_at") or now
+                    if parsed.get("battery_level") is not None:
+                        n["battery_level"] = parsed["battery_level"]
+                    if parsed.get("external_power") is not None:
+                        n["external_power"] = parsed["external_power"]
+                    node_name = node_name or n.get("name", "")
+                    app_name = app_name or n.get("application_name", "")
+                    break
+
+            rf_entry = self.node_rf_metrics.get(dev_eui, {})
+            if parsed.get("rssi") is not None:
+                rf_entry["rssi"] = float(parsed["rssi"])
+            if parsed.get("snr") is not None:
+                rf_entry["snr"] = float(parsed["snr"])
+            if parsed.get("dr") is not None:
+                rf_entry["dr"] = int(parsed["dr"])
+            if parsed.get("spreading_factor") is not None:
+                rf_entry["spreading_factor"] = int(parsed["spreading_factor"])
+            if parsed.get("bandwidth_khz") is not None:
+                rf_entry["bandwidth_khz"] = int(parsed["bandwidth_khz"])
+            if parsed.get("frequency_mhz") is not None:
+                rf_entry["frequency_mhz"] = float(parsed["frequency_mhz"])
+            if parsed.get("f_cnt") is not None:
+                rf_entry["f_cnt"] = int(parsed["f_cnt"])
+            if parsed.get("f_port") is not None:
+                rf_entry["f_port"] = int(parsed["f_port"])
+            if parsed.get("dev_addr"):
+                rf_entry["dev_addr"] = str(parsed["dev_addr"])
+            if parsed.get("adr") is not None:
+                rf_entry["adr"] = bool(parsed["adr"])
+            if parsed.get("gateway_id"):
+                rf_entry["last_gateway_id"] = str(parsed["gateway_id"])
+            if parsed.get("rx_gateways"):
+                rf_entry["rx_gateways"] = parsed["rx_gateways"]
+            rf_entry["updated_at"] = now.isoformat()
+            self.node_rf_metrics[dev_eui] = rf_entry
+
+        if gw_id:
+            for g in self.raw_gateways:
+                if g["gateway_id"].lower() == gw_id:
+                    g["last_seen_at"] = parsed.get("received_at") or now
+                    break
+
+        event_log = parsed.get("event_log")
+        if isinstance(event_log, dict):
+            if dev_eui and not event_log.get("dev_eui"):
+                event_log["dev_eui"] = dev_eui
+            if node_name and not event_log.get("device_name"):
+                event_log["device_name"] = node_name
+            if app_name and not event_log.get("application_name"):
+                event_log["application_name"] = app_name
+            if isinstance(event_log.get("received_at"), datetime):
+                event_log["received_at"] = event_log["received_at"].isoformat()
+            self.device_events.insert(0, event_log)
+            self.device_events = self.device_events[:300]
+
+        frame_log = parsed.get("frame_log")
+        if isinstance(frame_log, dict):
+            if dev_eui and not frame_log.get("dev_eui"):
+                frame_log["dev_eui"] = dev_eui
+            if isinstance(frame_log.get("received_at"), datetime):
+                frame_log["received_at"] = frame_log["received_at"].isoformat()
+            # Evitar duplicar la misma trama cuando llega tanto por gateway/event/up como por application/device/event/up en el mismo segundo
+            is_dup = False
+            if self.lorawan_frames:
+                top = self.lorawan_frames[0]
+                if (
+                    top.get("dev_eui") == frame_log.get("dev_eui")
+                    and top.get("f_cnt") is not None
+                    and top.get("f_cnt") == frame_log.get("f_cnt")
+                    and top.get("m_type") == frame_log.get("m_type")
+                ):
+                    # Enriquecer la trama existente si la nueva tiene phy_payload_hex o más datos
+                    if frame_log.get("phy_payload_hex") and not top.get("phy_payload_hex"):
+                        top["phy_payload_hex"] = frame_log["phy_payload_hex"]
+                        top["frame_details"] = frame_log.get("frame_details", top.get("frame_details"))
+                    if frame_log.get("data_hex") and not top.get("data_hex"):
+                        top["data_hex"] = frame_log["data_hex"]
+                    is_dup = True
+            if not is_dup:
+                self.lorawan_frames.insert(0, frame_log)
+                self.lorawan_frames = self.lorawan_frames[:300]
+
+        self._save_rf_logs()
+        self.evaluate_all()
+
+        # Notificar a clientes WebSocket conectados
+        if self.ws_clients:
+            dead_ws: List[WebSocket] = []
+            msg = json.dumps(
+                {
+                    "type": "RF_UPDATE",
+                    "dev_eui": dev_eui,
+                    "gateway_id": gw_id,
+                    "timestamp": now.isoformat(),
+                }
+            )
+            for ws in self.ws_clients:
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    dead_ws.append(ws)
+            for ws in dead_ws:
+                if ws in self.ws_clients:
+                    self.ws_clients.remove(ws)
+
     async def sync_from_chirpstack(self) -> bool:
         if not settings.chirpstack_api_token:
             self.chirpstack_connected = False
@@ -260,6 +472,19 @@ class RuntimeStore:
                     for d in devs:
                         d["application_name"] = a["name"]
                         d["tenant_name"] = tname
+                        dev_eui_lower = d["dev_eui"].lower()
+                        rf_cur = self.node_rf_metrics.get(dev_eui_lower, {})
+                        if d.get("last_seen_at") and rf_cur.get("rssi") is None:
+                            try:
+                                link_m = await chirpstack_client.get_device_link_metrics(dev_eui_lower)
+                                if link_m:
+                                    rf_cur.update({k: v for k, v in link_m.items() if v is not None})
+                                    self.node_rf_metrics[dev_eui_lower] = rf_cur
+                            except Exception:
+                                pass
+                        if rf_cur.get("snr") is None and d.get("snr_margin") is not None:
+                            rf_cur["snr"] = float(d["snr_margin"])
+                            self.node_rf_metrics[dev_eui_lower] = rf_cur
                         nodes_all.append(d)
 
             gateways = await chirpstack_client.fetch_gateways()
@@ -400,6 +625,14 @@ class RuntimeStore:
                 node_alarms.sort(key=lambda a: SEVERITY_RANK[a.severity], reverse=True)
                 highest_sev = node_alarms[0].severity
 
+            # Extraer calidad de señal RF (dBm / dB) y metadatos de radio
+            rf_info = self.node_rf_metrics.get(dev_eui_lower) or self.node_rf_metrics.get(dev_eui) or {}
+            rssi_val = rf_info.get("rssi")
+            snr_val = rf_info.get("snr")
+            if snr_val is None and raw.get("snr_margin") is not None:
+                snr_val = float(raw["snr_margin"])
+            sig_qual, rssi_disp, snr_disp = evaluate_signal_quality(rssi_val, snr_val)
+
             nodes_dto.append(
                 NodeMetadataDTO(
                     dev_eui=raw["dev_eui"],
@@ -424,6 +657,21 @@ class RuntimeStore:
                     registered_display=reg_display,
                     has_active_alarm=bool(node_alarms),
                     highest_alarm_severity=highest_sev,
+                    rssi=rssi_val,
+                    snr=snr_val,
+                    rssi_display=rssi_disp,
+                    snr_display=snr_disp,
+                    signal_quality=sig_qual,  # type: ignore
+                    dr=rf_info.get("dr"),
+                    spreading_factor=rf_info.get("spreading_factor"),
+                    bandwidth_khz=rf_info.get("bandwidth_khz"),
+                    frequency_mhz=rf_info.get("frequency_mhz"),
+                    f_cnt=rf_info.get("f_cnt"),
+                    f_port=rf_info.get("f_port"),
+                    dev_addr=rf_info.get("dev_addr"),
+                    adr=rf_info.get("adr"),
+                    last_gateway_id=rf_info.get("last_gateway_id"),
+                    rx_gateways=rf_info.get("rx_gateways") or [],
                 )
             )
 
@@ -1636,6 +1884,125 @@ async def update_rule(
     store._save_rules()
     store.evaluate_all()
     return rule
+
+
+# ---------------------------------------------------------------------------
+# ChirpStack Events & LoRaWAN Frames Logs (en vivo desde MQTT + caché local)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/nodes/{dev_eui}/events", response_model=List[ChirpStackEventLogDTO])
+async def get_node_events(
+    dev_eui: str,
+    event_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=300),
+    _: Dict = Depends(get_current_user),
+) -> List[ChirpStackEventLogDTO]:
+    clean_eui = dev_eui.strip().lower()
+    items = [e for e in store.device_events if (e.get("dev_eui") or "").lower() == clean_eui]
+    if event_type:
+        et = event_type.strip().lower()
+        items = [e for e in items if (e.get("event_type") or "").lower() == et]
+    return [ChirpStackEventLogDTO(**e) for e in items[:limit]]
+
+
+@app.get("/api/nodes/{dev_eui}/frames", response_model=List[LoRaWANFrameLogDTO])
+async def get_node_frames(
+    dev_eui: str,
+    m_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=300),
+    _: Dict = Depends(get_current_user),
+) -> List[LoRaWANFrameLogDTO]:
+    clean_eui = dev_eui.strip().lower()
+    rf_info = store.node_rf_metrics.get(clean_eui) or {}
+    known_dev_addr = (rf_info.get("dev_addr") or "").lower()
+    items = [
+        f
+        for f in store.lorawan_frames
+        if (f.get("dev_eui") or "").lower() == clean_eui
+        or (known_dev_addr and (f.get("dev_addr") or "").lower() == known_dev_addr)
+    ]
+    if m_type:
+        mt = m_type.strip().lower()
+        items = [f for f in items if mt in (f.get("m_type") or "").lower()]
+    return [LoRaWANFrameLogDTO(**f) for f in items[:limit]]
+
+
+@app.get("/api/gateways/{gateway_id}/frames", response_model=List[LoRaWANFrameLogDTO])
+async def get_gateway_frames(
+    gateway_id: str,
+    limit: int = Query(default=100, ge=1, le=300),
+    _: Dict = Depends(get_current_user),
+) -> List[LoRaWANFrameLogDTO]:
+    clean_gw = gateway_id.strip().lower()
+    items = [
+        f
+        for f in store.lorawan_frames
+        if (f.get("gateway_id") or "").lower() == clean_gw
+        or any((g.get("gateway_id") or "").lower() == clean_gw for g in (f.get("rx_gateways") or []))
+    ]
+    return [LoRaWANFrameLogDTO(**f) for f in items[:limit]]
+
+
+@app.get("/api/logs/events", response_model=List[ChirpStackEventLogDTO])
+async def list_all_chirpstack_events(
+    dev_eui: Optional[str] = Query(default=None),
+    event_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=300),
+    _: Dict = Depends(get_current_user),
+) -> List[ChirpStackEventLogDTO]:
+    items = store.device_events
+    if dev_eui:
+        clean_eui = dev_eui.strip().lower()
+        items = [e for e in items if clean_eui in (e.get("dev_eui") or "").lower()]
+    if event_type:
+        et = event_type.strip().lower()
+        items = [e for e in items if (e.get("event_type") or "").lower() == et]
+    return [ChirpStackEventLogDTO(**e) for e in items[:limit]]
+
+
+@app.get("/api/logs/frames", response_model=List[LoRaWANFrameLogDTO])
+async def list_all_lorawan_frames(
+    dev_eui: Optional[str] = Query(default=None),
+    gateway_id: Optional[str] = Query(default=None),
+    m_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=300),
+    _: Dict = Depends(get_current_user),
+) -> List[LoRaWANFrameLogDTO]:
+    items = store.lorawan_frames
+    if dev_eui:
+        clean_eui = dev_eui.strip().lower()
+        items = [f for f in items if clean_eui in (f.get("dev_eui") or "").lower()]
+    if gateway_id:
+        clean_gw = gateway_id.strip().lower()
+        items = [
+            f
+            for f in items
+            if clean_gw in (f.get("gateway_id") or "").lower()
+            or any(clean_gw in (g.get("gateway_id") or "").lower() for g in (f.get("rx_gateways") or []))
+        ]
+    if m_type:
+        mt = m_type.strip().lower()
+        items = [f for f in items if mt in (f.get("m_type") or "").lower()]
+    return [LoRaWANFrameLogDTO(**f) for f in items[:limit]]
+
+
+@app.delete("/api/logs", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_rf_logs(
+    dev_eui: Optional[str] = Query(default=None),
+    _: Dict = Depends(get_current_user),
+) -> None:
+    if dev_eui:
+        clean_eui = dev_eui.strip().lower()
+        store.device_events = [
+            e for e in store.device_events if (e.get("dev_eui") or "").lower() != clean_eui
+        ]
+        store.lorawan_frames = [
+            f for f in store.lorawan_frames if (f.get("dev_eui") or "").lower() != clean_eui
+        ]
+    else:
+        store.device_events = []
+        store.lorawan_frames = []
+    store._save_rf_logs()
 
 
 # ---------------------------------------------------------------------------

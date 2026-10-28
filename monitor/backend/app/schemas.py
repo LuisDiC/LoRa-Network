@@ -226,6 +226,82 @@ class NodeMetadataDTO(BaseModel):
     registered_display: str = Field(default="No disponible")
     has_active_alarm: bool = False
     highest_alarm_severity: Optional[AlarmSeverity] = None
+    # Métricas de calidad de enlace RF (dBm / dB)
+    rssi: Optional[int] = Field(default=None, description="RSSI del último uplink en dBm")
+    snr: Optional[float] = Field(default=None, description="SNR del último uplink en dB")
+    rssi_display: str = Field(default="— dBm")
+    snr_display: str = Field(default="— dB")
+    signal_quality: str = Field(default="Sin datos", description="Excelente, Buena, Regular, Débil o Sin datos")
+    dr: Optional[int] = None
+    spreading_factor: Optional[int] = None
+    bandwidth_khz: Optional[int] = None
+    frequency_mhz: Optional[float] = None
+    f_cnt: Optional[int] = None
+    f_port: Optional[int] = None
+    dev_addr: Optional[str] = None
+    adr: Optional[bool] = None
+    last_gateway_id: Optional[str] = None
+    rx_gateways: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ChirpStackEventLogDTO(BaseModel):
+    id: str
+    time: datetime
+    event_type: str = Field(description="up, join, status, ack, txack, log, down, location")
+    dev_eui: str
+    device_name: str = ""
+    application_id: Optional[str] = ""
+    application_name: Optional[str] = ""
+    dev_addr: Optional[str] = None
+    f_cnt: Optional[int] = None
+    f_port: Optional[int] = None
+    dr: Optional[int] = None
+    adr: Optional[bool] = None
+    confirmed: Optional[bool] = None
+    rssi: Optional[int] = None
+    snr: Optional[float] = None
+    frequency_mhz: Optional[float] = None
+    spreading_factor: Optional[int] = None
+    bandwidth_khz: Optional[int] = None
+    gateway_id: Optional[str] = None
+    data_base64: Optional[str] = None
+    data_hex: Optional[str] = None
+    decoded_object: Optional[Dict[str, Any]] = None
+    log_level: Optional[str] = None
+    log_code: Optional[str] = None
+    log_description: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class LoRaWANFrameLogDTO(BaseModel):
+    id: str
+    time: datetime
+    direction: Literal["UPLINK", "DOWNLINK"] = "UPLINK"
+    m_type: str = Field(description="UnconfirmedDataUp, ConfirmedDataUp, JoinRequest, JoinAccept, UnconfirmedDataDown, ConfirmedDataDown")
+    dev_eui: Optional[str] = None
+    device_name: Optional[str] = None
+    dev_addr: Optional[str] = None
+    gateway_id: Optional[str] = None
+    rx_gateways: List[Dict[str, Any]] = Field(default_factory=list)
+    rssi: Optional[int] = None
+    snr: Optional[float] = None
+    frequency_mhz: Optional[float] = None
+    spreading_factor: Optional[int] = None
+    bandwidth_khz: Optional[int] = None
+    code_rate: Optional[str] = None
+    dr: Optional[int] = None
+    channel: Optional[int] = None
+    adr: Optional[bool] = None
+    f_cnt: Optional[int] = None
+    f_port: Optional[int] = None
+    confirmed: Optional[bool] = None
+    phy_payload_hex: Optional[str] = None
+    data_hex: Optional[str] = None
+    data_base64: Optional[str] = None
+    mic_hex: Optional[str] = None
+    tx_info: Dict[str, Any] = Field(default_factory=dict)
+    rx_info: List[Dict[str, Any]] = Field(default_factory=list)
+    frame_details: Dict[str, Any] = Field(default_factory=dict)
 
 
 class GatewayMetadataDTO(BaseModel):

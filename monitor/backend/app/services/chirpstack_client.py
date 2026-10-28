@@ -1,7 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import base64
 import json
 import logging
+import uuid
 import httpx
 from app.config import settings
 from app.schemas import CommState
@@ -73,63 +75,409 @@ def format_location(lat: Optional[float], lon: Optional[float]) -> Tuple[bool, s
     return True, f"{lat:.5f}, {lon:.5f}"
 
 
-def sanitize_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict[str, Any]]:
+def evaluate_signal_quality(rssi: Optional[int], snr: Optional[float]) -> Tuple[str, str, str]:
     """
-    Procesa un mensaje MQTT de ChirpStack v4 descartando inmediatamente cualquier
-    payload de aplicación ('data', 'object', 'rxInfo', 'txInfo') para garantizar
-    que jamás ingresen mediciones de sensores al sistema.
+    Evalúa la calidad de conexión RF del nodo a partir de RSSI (dBm) y SNR (dB).
+    Retorna: (rssi_display, snr_display, signal_quality)
     """
+    rssi_display = f"{int(rssi)} dBm" if rssi is not None else "— dBm"
+    if snr is not None:
+        sign = "+" if snr > 0 else ""
+        snr_display = f"{sign}{snr:.1f} dB"
+    else:
+        snr_display = "— dB"
+
+    if rssi is None and snr is None:
+        return rssi_display, snr_display, "Sin datos"
+
+    r_val = rssi if rssi is not None else -90
+    s_val = snr if snr is not None else 2.0
+
+    if r_val >= -85 and s_val >= 5.0:
+        quality = "Excelente"
+    elif r_val >= -100 and s_val >= 0.0:
+        quality = "Buena"
+    elif r_val >= -115 and s_val >= -7.5:
+        quality = "Regular"
+    else:
+        quality = "Débil"
+
+    return rssi_display, snr_display, quality
+
+
+def parse_lorawan_phy_payload(phy_bytes: bytes) -> Dict[str, Any]:
+    """
+    Decodifica la cabecera física/MAC estándar LoRaWAN 1.0/1.1 desde bytes crudos (PHYPayload).
+    Extrae MType, DevEUI/JoinEUI (en JoinRequest), DevAddr/FCnt/FPort/ADR (en DataUp/Down) y MIC.
+    """
+    if not phy_bytes:
+        return {}
+    mhdr = phy_bytes[0]
+    mtype_num = (mhdr >> 5) & 0x07
+    mtype_names = {
+        0: "JoinRequest",
+        1: "JoinAccept",
+        2: "UnconfirmedDataUp",
+        3: "UnconfirmedDataDown",
+        4: "ConfirmedDataUp",
+        5: "ConfirmedDataDown",
+        6: "RejoinRequest",
+        7: "Proprietary",
+    }
+    m_type = mtype_names.get(mtype_num, "Unknown")
+    result: Dict[str, Any] = {
+        "m_type": m_type,
+        "phy_payload_hex": phy_bytes.hex(),
+        "mic_hex": phy_bytes[-4:].hex() if len(phy_bytes) >= 5 else None,
+    }
+
+    if mtype_num == 0 and len(phy_bytes) >= 23:
+        # JoinRequest: MHDR(1) | JoinEUI(8 LE) | DevEUI(8 LE) | DevNonce(2 LE) | MIC(4)
+        join_eui = phy_bytes[1:9][::-1].hex()
+        dev_eui = phy_bytes[9:17][::-1].hex()
+        dev_nonce = int.from_bytes(phy_bytes[17:19], "little")
+        result.update(
+            {
+                "join_eui": join_eui,
+                "dev_eui": dev_eui,
+                "dev_nonce": dev_nonce,
+            }
+        )
+    elif mtype_num in (2, 3, 4, 5) and len(phy_bytes) >= 12:
+        # DataUp / DataDown: MHDR(1) | DevAddr(4 LE) | FCtrl(1) | FCnt(2 LE) | FOpts(0..15) | [FPort(1) | FRMPayload] | MIC(4)
+        dev_addr = phy_bytes[1:5][::-1].hex()
+        f_ctrl = phy_bytes[5]
+        adr = bool(f_ctrl & 0x80)
+        ack = bool(f_ctrl & 0x20)
+        f_opts_len = f_ctrl & 0x0F
+        f_cnt = int.from_bytes(phy_bytes[6:8], "little")
+        f_port: Optional[int] = None
+        frm_hex: Optional[str] = None
+        if len(phy_bytes) > 8 + f_opts_len + 4:
+            f_port = phy_bytes[8 + f_opts_len]
+            frm_hex = phy_bytes[9 + f_opts_len : -4].hex()
+        result.update(
+            {
+                "dev_addr": dev_addr,
+                "adr": adr,
+                "ack": ack,
+                "f_cnt": f_cnt,
+                "f_port": f_port,
+                "data_hex": frm_hex,
+                "confirmed": mtype_num in (4, 5),
+            }
+        )
+    return result
+
+
+def parse_chirpstack_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Procesa mensajes MQTT de ChirpStack v4:
+    1) application/{app_id}/device/{dev_eui}/event/{up|join|status|ack|txack|log|location}
+    2) application/{app_id}/device/{dev_eui}/command/down
+    3) */gateway/{gateway_id}/event/{up|stats|ack} y */gateway/{gateway_id}/command/down
+    Extrae métricas RF (RSSI en dBm, SNR en dB, SF, BW, Frecuencia, FCnt, FPort)
+    y genera registros estructurados para Events y LoRaWAN Frames.
+    """
+    now = datetime.now(timezone.utc)
+    parsed: Optional[Dict[str, Any]] = None
     try:
         parsed = json.loads(raw_payload.decode("utf-8"))
     except Exception:
-        return None
+        parsed = None
 
-    # Purga explícita de campos de sensores/payloads y radiofrecuencia
-    for forbidden_key in ("data", "object", "rxInfo", "txInfo", "dr", "fCnt", "fPort"):
-        parsed.pop(forbidden_key, None)
+    # Caso A: Eventos de aplicación/dispositivo en JSON (application/+/device/+/event/+)
+    if parsed and ("/device/" in topic and ("/event/" in topic or "/command/" in topic)):
+        parts = topic.split("/")
+        event_type = parts[-1].lower() if parts else "up"
+        device_info = parsed.get("deviceInfo") or {}
+        dev_eui = (device_info.get("devEui") or parsed.get("devEui") or "").strip().lower()
+        if not dev_eui and "device" in parts:
+            idx = parts.index("device")
+            if idx + 1 < len(parts):
+                dev_eui = parts[idx + 1].strip().lower()
+        if not dev_eui:
+            return None
 
-    device_info = parsed.get("deviceInfo") or {}
-    dev_eui = device_info.get("devEui")
-    event_time_str = parsed.get("time")
+        event_time = now
+        event_time_str = parsed.get("time")
+        if isinstance(event_time_str, str):
+            try:
+                event_time = datetime.fromisoformat(event_time_str.replace("Z", "+00:00"))
+            except ValueError:
+                pass
 
-    event_time = datetime.now(timezone.utc)
-    if isinstance(event_time_str, str):
-        try:
-            event_time = datetime.fromisoformat(event_time_str.replace("Z", "+00:00"))
-        except ValueError:
-            pass
+        device_name = device_info.get("deviceName") or dev_eui
+        app_id = str(device_info.get("applicationId") or "")
+        app_name = str(device_info.get("applicationName") or "")
+        tenant_id = str(device_info.get("tenantId") or "")
 
-    if "/event/up" in topic and dev_eui:
-        return {
-            "kind": "NODE_ACTIVITY",
+        # Extraer rxInfo (RSSI en dBm y SNR en dB por gateway)
+        rx_info_raw = parsed.get("rxInfo") or []
+        rx_gateways: List[Dict[str, Any]] = []
+        best_rssi: Optional[int] = None
+        best_snr: Optional[float] = None
+        best_gw_id: Optional[str] = None
+        best_channel: Optional[int] = None
+
+        for rx in rx_info_raw:
+            if not isinstance(rx, dict):
+                continue
+            gw_id = str(rx.get("gatewayId") or "").strip().lower()
+            rssi_val = int(round(float(rx["rssi"]))) if isinstance(rx.get("rssi"), (int, float)) else None
+            snr_val = round(float(rx["snr"]), 1) if isinstance(rx.get("snr"), (int, float)) else None
+            ch_val = int(rx["channel"]) if isinstance(rx.get("channel"), (int, float)) else None
+            rx_gateways.append(
+                {
+                    "gateway_id": gw_id,
+                    "rssi": rssi_val,
+                    "snr": snr_val,
+                    "channel": ch_val,
+                    "rf_chain": rx.get("rfChain"),
+                    "crc_status": rx.get("crcStatus", "CRC_OK"),
+                }
+            )
+            if rssi_val is not None and (best_rssi is None or rssi_val > best_rssi):
+                best_rssi = rssi_val
+                best_gw_id = gw_id or best_gw_id
+                best_channel = ch_val if ch_val is not None else best_channel
+            if snr_val is not None and (best_snr is None or snr_val > best_snr):
+                best_snr = snr_val
+                if not best_gw_id and gw_id:
+                    best_gw_id = gw_id
+
+        # Extraer txInfo (Frecuencia MHz, Spreading Factor, Bandwidth kHz, Code Rate)
+        tx_info_raw = parsed.get("txInfo") or {}
+        freq_hz = tx_info_raw.get("frequency")
+        freq_mhz: Optional[float] = (
+            round(float(freq_hz) / 1_000_000.0, 3)
+            if isinstance(freq_hz, (int, float)) and freq_hz > 0
+            else None
+        )
+        lora_mod = ((tx_info_raw.get("modulation") or {}).get("lora")) or {}
+        sf_val: Optional[int] = (
+            int(lora_mod["spreadingFactor"])
+            if isinstance(lora_mod.get("spreadingFactor"), (int, float))
+            else None
+        )
+        bw_hz = lora_mod.get("bandwidth")
+        bw_khz: Optional[int] = (
+            int(float(bw_hz) // 1000) if isinstance(bw_hz, (int, float)) and bw_hz > 0 else None
+        )
+        code_rate: Optional[str] = lora_mod.get("codeRate")
+
+        dr_val = int(parsed["dr"]) if isinstance(parsed.get("dr"), (int, float)) else None
+        adr_val = bool(parsed["adr"]) if parsed.get("adr") is not None else None
+        fcnt_val = int(parsed["fCnt"]) if isinstance(parsed.get("fCnt"), (int, float)) else None
+        fport_val = int(parsed["fPort"]) if isinstance(parsed.get("fPort"), (int, float)) else None
+        confirmed_val = bool(parsed["confirmed"]) if parsed.get("confirmed") is not None else None
+        dev_addr = str(parsed["devAddr"]).lower() if parsed.get("devAddr") else None
+
+        data_b64 = parsed.get("data") if isinstance(parsed.get("data"), str) else None
+        data_hex: Optional[str] = None
+        if data_b64:
+            try:
+                data_hex = base64.b64decode(data_b64).hex()
+            except Exception:
+                data_hex = None
+
+        decoded_obj = parsed.get("object") if isinstance(parsed.get("object"), dict) else None
+
+        # Si es un evento status, puede incluir batteryLevel y margin (dB)
+        battery_level: Optional[float] = None
+        external_power: Optional[bool] = None
+        if event_type == "status":
+            bat_raw = parsed.get("batteryLevel")
+            if isinstance(bat_raw, (int, float)) and not parsed.get("batteryLevelUnavailable", False):
+                battery_level = float(bat_raw)
+            if parsed.get("externalPowerSource") is not None:
+                external_power = bool(parsed.get("externalPowerSource"))
+            if best_snr is None and isinstance(parsed.get("margin"), (int, float)):
+                best_snr = float(parsed["margin"])
+
+        event_log = {
+            "id": str(parsed.get("deduplicationId") or uuid.uuid4()),
+            "time": event_time,
+            "event_type": event_type,
             "dev_eui": dev_eui,
-            "name": device_info.get("deviceName"),
-            "tenant_id": device_info.get("tenantId"),
-            "application_id": device_info.get("applicationId"),
-            "last_seen_at": event_time,
+            "device_name": device_name,
+            "application_id": app_id,
+            "application_name": app_name,
+            "dev_addr": dev_addr,
+            "f_cnt": fcnt_val,
+            "f_port": fport_val,
+            "dr": dr_val,
+            "adr": adr_val,
+            "confirmed": confirmed_val,
+            "rssi": best_rssi,
+            "snr": best_snr,
+            "frequency_mhz": freq_mhz,
+            "spreading_factor": sf_val,
+            "bandwidth_khz": bw_khz,
+            "gateway_id": best_gw_id,
+            "data_base64": data_b64,
+            "data_hex": data_hex,
+            "decoded_object": decoded_obj,
+            "log_level": parsed.get("level") if event_type == "log" else None,
+            "log_code": parsed.get("code") if event_type == "log" else None,
+            "log_description": parsed.get("description") if event_type == "log" else None,
+            "details": parsed,
         }
 
-    if "/event/status" in topic and dev_eui:
-        battery_level = parsed.get("batteryLevel")
-        external_power = parsed.get("externalPowerSource")
+        frame_log: Optional[Dict[str, Any]] = None
+        if event_type in ("up", "join", "down", "txack"):
+            if event_type == "up":
+                m_type = "ConfirmedDataUp" if confirmed_val else "UnconfirmedDataUp"
+                direction = "UPLINK"
+            elif event_type == "join":
+                m_type = "JoinRequest"
+                direction = "UPLINK"
+            else:
+                m_type = "ConfirmedDataDown" if confirmed_val else "UnconfirmedDataDown"
+                direction = "DOWNLINK"
+
+            frame_log = {
+                "id": f"frm-{event_log['id']}",
+                "time": event_time,
+                "direction": direction,
+                "m_type": m_type,
+                "dev_eui": dev_eui,
+                "device_name": device_name,
+                "dev_addr": dev_addr,
+                "gateway_id": best_gw_id,
+                "rx_gateways": rx_gateways,
+                "rssi": best_rssi,
+                "snr": best_snr,
+                "frequency_mhz": freq_mhz,
+                "spreading_factor": sf_val,
+                "bandwidth_khz": bw_khz,
+                "code_rate": code_rate,
+                "dr": dr_val,
+                "channel": best_channel,
+                "adr": adr_val,
+                "f_cnt": fcnt_val,
+                "f_port": fport_val,
+                "confirmed": confirmed_val,
+                "phy_payload_hex": data_hex,
+                "data_hex": data_hex,
+                "data_base64": data_b64,
+                "mic_hex": None,
+                "tx_info": tx_info_raw,
+                "rx_info": rx_info_raw,
+                "frame_details": {
+                    "mhdr": {"mType": m_type, "major": "LoRaWANR1"},
+                    "macPayload": {
+                        "fhdr": {
+                            "devAddr": dev_addr,
+                            "fCtrl": {"adr": adr_val},
+                            "fCnt": fcnt_val,
+                        },
+                        "fPort": fport_val,
+                        "frmPayloadHex": data_hex,
+                    },
+                    "txInfo": tx_info_raw,
+                    "rxInfo": rx_info_raw,
+                },
+            }
+
         return {
-            "kind": "NODE_STATUS",
+            "kind": "DEVICE_EVENT",
+            "event_type": event_type,
             "dev_eui": dev_eui,
+            "name": device_name,
+            "tenant_id": tenant_id,
+            "application_id": app_id,
             "last_seen_at": event_time,
-            "battery_level": float(battery_level)
-            if isinstance(battery_level, (int, float)) and not parsed.get("batteryLevelUnavailable", False)
-            else None,
-            "external_power": bool(external_power) if external_power is not None else None,
+            "battery_level": battery_level,
+            "external_power": external_power,
+            "rssi": best_rssi,
+            "snr": best_snr,
+            "dr": dr_val,
+            "spreading_factor": sf_val,
+            "bandwidth_khz": bw_khz,
+            "frequency_mhz": freq_mhz,
+            "f_cnt": fcnt_val,
+            "f_port": fport_val,
+            "dev_addr": dev_addr,
+            "adr": adr_val,
+            "last_gateway_id": best_gw_id,
+            "rx_gateways": rx_gateways,
+            "event_log": event_log,
+            "frame_log": frame_log,
         }
 
-    if "/gateway/" in topic and "gatewayId" in parsed:
-        return {
-            "kind": "GATEWAY_STATE",
-            "gateway_id": parsed["gatewayId"],
-            "last_seen_at": event_time,
-        }
+    # Caso B: Mensajes de Gateway en JSON (stats, up, down)
+    if parsed and "/gateway/" in topic:
+        parts = topic.split("/")
+        gw_id = str(parsed.get("gatewayId") or "").strip().lower()
+        if not gw_id and "gateway" in parts:
+            idx = parts.index("gateway")
+            if idx + 1 < len(parts):
+                gw_id = parts[idx + 1].strip().lower()
+
+        phy_b64 = parsed.get("phyPayload")
+        frame_log = None
+        if isinstance(phy_b64, str) and phy_b64:
+            try:
+                phy_bytes = base64.b64decode(phy_b64)
+                phy_info = parse_lorawan_phy_payload(phy_bytes)
+                rx_info = parsed.get("rxInfo") or {}
+                tx_info = parsed.get("txInfo") or {}
+                rssi_val = int(round(float(rx_info["rssi"]))) if isinstance(rx_info.get("rssi"), (int, float)) else None
+                snr_val = round(float(rx_info["snr"]), 1) if isinstance(rx_info.get("snr"), (int, float)) else None
+                freq_hz = tx_info.get("frequency")
+                freq_mhz = round(float(freq_hz) / 1_000_000.0, 3) if isinstance(freq_hz, (int, float)) and freq_hz > 0 else None
+                lora_mod = ((tx_info.get("modulation") or {}).get("lora")) or {}
+                sf_val = int(lora_mod["spreadingFactor"]) if isinstance(lora_mod.get("spreadingFactor"), (int, float)) else None
+                bw_hz = lora_mod.get("bandwidth")
+                bw_khz = int(float(bw_hz) // 1000) if isinstance(bw_hz, (int, float)) and bw_hz > 0 else None
+                is_down = "/command/down" in topic
+                frame_log = {
+                    "id": f"gwfrm-{uuid.uuid4()}",
+                    "time": now,
+                    "direction": "DOWNLINK" if is_down else "UPLINK",
+                    "m_type": phy_info.get("m_type", "Downlink" if is_down else "Uplink"),
+                    "dev_eui": phy_info.get("dev_eui"),
+                    "device_name": None,
+                    "dev_addr": phy_info.get("dev_addr"),
+                    "gateway_id": gw_id,
+                    "rx_gateways": [{"gateway_id": gw_id, "rssi": rssi_val, "snr": snr_val, "channel": rx_info.get("channel")}] if gw_id else [],
+                    "rssi": rssi_val,
+                    "snr": snr_val,
+                    "frequency_mhz": freq_mhz,
+                    "spreading_factor": sf_val,
+                    "bandwidth_khz": bw_khz,
+                    "code_rate": lora_mod.get("codeRate"),
+                    "dr": None,
+                    "channel": rx_info.get("channel"),
+                    "adr": phy_info.get("adr"),
+                    "f_cnt": phy_info.get("f_cnt"),
+                    "f_port": phy_info.get("f_port"),
+                    "confirmed": phy_info.get("confirmed"),
+                    "phy_payload_hex": phy_info.get("phy_payload_hex"),
+                    "data_hex": phy_info.get("data_hex"),
+                    "data_base64": phy_b64,
+                    "mic_hex": phy_info.get("mic_hex"),
+                    "tx_info": tx_info,
+                    "rx_info": [rx_info] if rx_info else [],
+                    "frame_details": parsed,
+                }
+            except Exception:
+                pass
+
+        if gw_id:
+            return {
+                "kind": "GATEWAY_STATE",
+                "gateway_id": gw_id,
+                "last_seen_at": now,
+                "frame_log": frame_log,
+            }
 
     return None
+
+
+def sanitize_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict[str, Any]]:
+    return parse_chirpstack_mqtt_event(topic, raw_payload)
 
 
 class ChirpStackV4Client:
@@ -563,10 +911,15 @@ class ChirpStackV4Client:
             status_block = item.get("deviceStatus") or {}
             battery_raw = status_block.get("batteryLevel")
             ext_power = status_block.get("externalPowerSource")
+            margin_raw = status_block.get("margin")
 
             battery_level: Optional[float] = None
             if isinstance(battery_raw, (int, float)) and 0 <= battery_raw <= 100:
                 battery_level = float(battery_raw)
+
+            snr_margin: Optional[float] = None
+            if isinstance(margin_raw, (int, float)) and -40 <= margin_raw <= 40:
+                snr_margin = float(margin_raw)
 
             devices.append(
                 {
@@ -578,11 +931,75 @@ class ChirpStackV4Client:
                     "registered_at": created_at,
                     "battery_level": battery_level,
                     "external_power": bool(ext_power) if ext_power is not None else None,
+                    "snr_margin": snr_margin,
                     "latitude": None,
                     "longitude": None,
                 }
             )
         return devices
+
+    async def get_device_link_metrics(self, dev_eui: str) -> Dict[str, Any]:
+        """
+        Consulta /api/devices/{dev_eui}/link-metrics en ChirpStack v4 para obtener
+        el último RSSI (dBm), SNR (dB), DR y Frecuencia registrados en las últimas 24h.
+        """
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            data = await self._get(
+                f"/api/devices/{dev_eui}/link-metrics",
+                {"start": start, "end": end, "aggregation": "HOUR"},
+            )
+        except Exception:
+            return {}
+
+        result: Dict[str, Any] = {}
+
+        def _last_non_zero(metric_block: Any) -> Optional[float]:
+            if not isinstance(metric_block, dict):
+                return None
+            datasets = metric_block.get("datasets") or []
+            for ds in datasets:
+                vals = ds.get("data") or []
+                for v in reversed(vals):
+                    if isinstance(v, (int, float)) and v != 0:
+                        return float(v)
+            return None
+
+        rssi_val = _last_non_zero(data.get("gwRssi"))
+        if rssi_val is not None:
+            result["rssi"] = int(round(rssi_val))
+
+        snr_val = _last_non_zero(data.get("gwSnr"))
+        if snr_val is not None:
+            result["snr"] = round(snr_val, 1)
+
+        # Extraer último DR usado
+        dr_block = data.get("rxPacketsPerDr")
+        if isinstance(dr_block, dict):
+            for ds in dr_block.get("datasets") or []:
+                vals = ds.get("data") or []
+                if any(isinstance(v, (int, float)) and v > 0 for v in vals):
+                    lbl = str(ds.get("label", "")).replace("DR", "").strip()
+                    if lbl.isdigit():
+                        result["dr"] = int(lbl)
+
+        # Extraer última frecuencia usada
+        freq_block = data.get("rxPacketsPerFreq")
+        if isinstance(freq_block, dict):
+            for ds in freq_block.get("datasets") or []:
+                vals = ds.get("data") or []
+                if any(isinstance(v, (int, float)) and v > 0 for v in vals):
+                    lbl = str(ds.get("label", "")).strip()
+                    try:
+                        hz = float(lbl)
+                        if hz > 1_000_000:
+                            result["frequency_mhz"] = round(hz / 1_000_000.0, 3)
+                    except ValueError:
+                        pass
+
+        return result
 
     async def fetch_gateways(self, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"limit": 200}
