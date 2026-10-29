@@ -93,18 +93,30 @@ async def lifespan(app: FastAPI):
                     "hostname": settings.chirpstack_mqtt_host,
                     "port": settings.chirpstack_mqtt_port,
                 }
-                if settings.chirpstack_mqtt_username:
-                    mqtt_kwargs["username"] = settings.chirpstack_mqtt_username
+                mqtt_user = getattr(settings, "chirpstack_mqtt_username", None) or getattr(settings, "chirpstack_mqtt_user", None) or ""
+                if mqtt_user:
+                    mqtt_kwargs["username"] = mqtt_user
                 if settings.chirpstack_mqtt_password:
                     mqtt_kwargs["password"] = settings.chirpstack_mqtt_password
 
                 async with aiomqtt.Client(**mqtt_kwargs) as client:
-                    await client.subscribe("application/+/device/+/event/+")
-                    await client.subscribe("application/+/device/+/command/+")
-                    await client.subscribe("+/gateway/+/event/+")
-                    await client.subscribe("gateway/+/event/+")
-                    await client.subscribe("+/gateway/+/command/+")
-                    await client.subscribe("gateway/+/command/+")
+                    subscriptions = [
+                        "application/#",
+                        "device/#",
+                        "+/gateway/#",
+                        "gateway/#",
+                        "+/device/#",
+                        "+/application/#",
+                        "application/+/device/+/event/+",
+                        "application/+/device/+/command/+",
+                        "+/gateway/+/event/+",
+                        "gateway/+/event/+",
+                    ]
+                    for sub_t in subscriptions:
+                        try:
+                            await client.subscribe(sub_t)
+                        except Exception as sub_err:
+                            logger.debug("Error suscribiendo a %s: %s", sub_t, sub_err)
                     logger.info(
                         "Suscrito a MQTT ChirpStack (%s:%d) para captura en vivo de Events, Frames y dBm/dB",
                         settings.chirpstack_mqtt_host,
@@ -174,7 +186,8 @@ class RuntimeStore:
                 notify_recovery=True,
             )
         }
-        self.push_tokens: Dict[str, List[str]] = {}
+        self.push_tokens_file = Path("data/push_tokens.json")
+        self.push_tokens: Dict[str, List[str]] = self._load_push_tokens()
         self.custom_locations_file = Path("data/custom_locations.json")
         self.custom_locations: Dict[str, Dict[str, float]] = self._load_custom_locations()
         self.node_alerts_file = Path("data/node_alerts.json")
@@ -243,6 +256,25 @@ class RuntimeStore:
                 json.dump({k: v.model_dump() for k, v in self.rules.items()}, f, indent=2)
         except Exception as e:
             logger.error("Error guardando alarm_rules.json: %s", e)
+
+    def _load_push_tokens(self) -> Dict[str, List[str]]:
+        try:
+            if self.push_tokens_file.exists():
+                with open(self.push_tokens_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return {str(k): list(v) if isinstance(v, list) else [] for k, v in data.items()}
+        except Exception as e:
+            logger.warning("No se pudo cargar push_tokens.json: %s", e)
+        return {}
+
+    def _save_push_tokens(self) -> None:
+        try:
+            self.push_tokens_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.push_tokens_file, "w", encoding="utf-8") as f:
+                json.dump(self.push_tokens, f, indent=2)
+        except Exception as e:
+            logger.error("Error guardando push_tokens.json: %s", e)
 
     def _load_custom_locations(self) -> Dict[str, Dict[str, float]]:
         try:
@@ -342,7 +374,7 @@ class RuntimeStore:
         if dev_eui:
             for n in self.raw_nodes:
                 if n["dev_eui"].lower() == dev_eui:
-                    n["last_seen_at"] = parsed.get("received_at") or now
+                    n["last_seen_at"] = parsed.get("last_seen_at") or parsed.get("received_at") or now
                     if parsed.get("battery_level") is not None:
                         n["battery_level"] = parsed["battery_level"]
                     if parsed.get("external_power") is not None:
@@ -382,7 +414,7 @@ class RuntimeStore:
         if gw_id:
             for g in self.raw_gateways:
                 if g["gateway_id"].lower() == gw_id:
-                    g["last_seen_at"] = parsed.get("received_at") or now
+                    g["last_seen_at"] = parsed.get("last_seen_at") or parsed.get("received_at") or now
                     break
 
         event_log = parsed.get("event_log")
@@ -393,6 +425,12 @@ class RuntimeStore:
                 event_log["device_name"] = node_name
             if app_name and not event_log.get("application_name"):
                 event_log["application_name"] = app_name
+            if not event_log.get("time"):
+                event_log["time"] = now
+            if not event_log.get("received_at"):
+                event_log["received_at"] = event_log["time"]
+            if isinstance(event_log.get("time"), datetime):
+                event_log["time"] = event_log["time"].isoformat()
             if isinstance(event_log.get("received_at"), datetime):
                 event_log["received_at"] = event_log["received_at"].isoformat()
             self.device_events.insert(0, event_log)
@@ -402,6 +440,12 @@ class RuntimeStore:
         if isinstance(frame_log, dict):
             if dev_eui and not frame_log.get("dev_eui"):
                 frame_log["dev_eui"] = dev_eui
+            if not frame_log.get("time"):
+                frame_log["time"] = now
+            if not frame_log.get("received_at"):
+                frame_log["received_at"] = frame_log["time"]
+            if isinstance(frame_log.get("time"), datetime):
+                frame_log["time"] = frame_log["time"].isoformat()
             if isinstance(frame_log.get("received_at"), datetime):
                 frame_log["received_at"] = frame_log["received_at"].isoformat()
             # Evitar duplicar la misma trama cuando llega tanto por gateway/event/up como por application/device/event/up en el mismo segundo
@@ -514,6 +558,7 @@ class RuntimeStore:
         node_rule = self.rules["NODE_SILENT"]
         gw_rule = self.rules["GATEWAY_OFFLINE"]
         bat_rule = self.rules["LOW_BATTERY"]
+        newly_triggered: List[AlarmDTO] = []
 
         nodes_dto: List[NodeMetadataDTO] = []
         for raw in self.raw_nodes:
@@ -565,7 +610,7 @@ class RuntimeStore:
                     elapsed_str = f"{mins} min"
                     thresh_str = f"{inact_val} min"
 
-                alarm_engine.trigger_or_update(
+                al, is_new = alarm_engine.trigger_or_update(
                     rule_code="NODE_SILENT",
                     severity=node_rule.severity,
                     entity_type="NODE",
@@ -581,6 +626,8 @@ class RuntimeStore:
                     last_activity_at=raw["last_seen_at"],
                     now=now,
                 )
+                if is_new and al:
+                    newly_triggered.append(al)
             elif state == "ACTIVE" or not inact_enabled:
                 alarm_engine.resolve_if_recovered(
                     "NODE_SILENT", "NODE", raw["dev_eui"], "Comunicación de nodo restablecida", now
@@ -593,7 +640,7 @@ class RuntimeStore:
                 and bat_enabled
                 and bat_val <= bat_thresh
             ):
-                alarm_engine.trigger_or_update(
+                al, is_new = alarm_engine.trigger_or_update(
                     rule_code="LOW_BATTERY",
                     severity=bat_rule.severity,
                     entity_type="NODE",
@@ -609,6 +656,8 @@ class RuntimeStore:
                     last_activity_at=raw["last_seen_at"],
                     now=now,
                 )
+                if is_new and al:
+                    newly_triggered.append(al)
             elif (bat_val is not None and bat_val > bat_thresh) or not bat_enabled:
                 alarm_engine.resolve_if_recovered(
                     "LOW_BATTERY", "NODE", raw["dev_eui"], f"Batería recuperada a {int(bat_val or 0)}%", now
@@ -714,7 +763,7 @@ class RuntimeStore:
                     gw_elapsed_str = f"{mins} min"
                     gw_thresh_str = f"{gw_val} min"
 
-                alarm_engine.trigger_or_update(
+                al, is_new = alarm_engine.trigger_or_update(
                     rule_code="GATEWAY_OFFLINE",
                     severity=gw_rule.severity,
                     entity_type="GATEWAY",
@@ -730,6 +779,8 @@ class RuntimeStore:
                     last_activity_at=gw["last_seen_at"],
                     now=now,
                 )
+                if is_new and al:
+                    newly_triggered.append(al)
             elif state == "ACTIVE" or not gw_enabled:
                 alarm_engine.resolve_if_recovered(
                     "GATEWAY_OFFLINE", "GATEWAY", gw["gateway_id"], "Gateway nuevamente en línea", now
@@ -761,7 +812,31 @@ class RuntimeStore:
                 )
             )
 
+        if newly_triggered:
+            try:
+                loop = asyncio.get_running_loop()
+                for new_al in newly_triggered:
+                    loop.create_task(self._notify_users_alarm(new_al))
+            except RuntimeError:
+                pass
+
         return nodes_dto, gateways_dto
+
+    async def _notify_users_alarm(self, alarm: AlarmDTO) -> None:
+        logger.info(
+            "Despachando push para alarma %s [%s] (%s)",
+            alarm.id,
+            alarm.severity,
+            alarm.title,
+        )
+        for username, tokens in list(self.push_tokens.items()):
+            if not tokens:
+                continue
+            prefs = self.get_user_prefs(username)
+            try:
+                await push_service.dispatch_alarm_push(alarm, username, tokens, prefs)
+            except Exception as e:
+                logger.error("Error enviando push a usuario '%s': %s", username, e)
 
 
 store = RuntimeStore()
@@ -2012,7 +2087,7 @@ async def clear_rf_logs(
 class PushTokenRequest(BaseModel):
     """Cuerpo esperado por POST /api/push-token."""
     token: str
-    platform: Literal["android", "ios"]
+    platform: Optional[str] = "android"
 
 
 @app.post("/api/push-token", status_code=status.HTTP_204_NO_CONTENT)
@@ -2026,11 +2101,16 @@ async def register_push_token(
     Un mismo usuario puede tener varios tokens (múltiples dispositivos).
     """
     username = user["username"]
+    token_clean = body.token.strip()
+    if not token_clean:
+        return
     if username not in store.push_tokens:
         store.push_tokens[username] = []
     tokens = store.push_tokens[username]
-    if body.token not in tokens:
-        tokens.append(body.token)
+    if token_clean not in tokens:
+        tokens.append(token_clean)
+        store._save_push_tokens()
+        logger.info("Token push registrado con éxito para usuario '%s': %s (total activos: %d)", username, token_clean, len(tokens))
 
 
 @app.delete("/api/push-token", status_code=status.HTTP_204_NO_CONTENT)
@@ -2043,9 +2123,12 @@ async def remove_push_token(
     Si el token no existe para el usuario, la operación es silenciosa (idempotente).
     """
     username = user["username"]
+    token_clean = body.token.strip()
     tokens = store.push_tokens.get(username, [])
-    if body.token in tokens:
-        tokens.remove(body.token)
+    if token_clean in tokens:
+        tokens.remove(token_clean)
+        store._save_push_tokens()
+        logger.info("Token push eliminado para usuario '%s': %s", username, token_clean)
 
 
 @app.websocket("/ws/updates")

@@ -186,10 +186,27 @@ def parse_chirpstack_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict
     except Exception:
         parsed = None
 
-    # Caso A: Eventos de aplicación/dispositivo en JSON (application/+/device/+/event/+)
-    if parsed and ("/device/" in topic and ("/event/" in topic or "/command/" in topic)):
-        parts = topic.split("/")
-        event_type = parts[-1].lower() if parts else "up"
+    # Detectar tipo de mensaje (dispositivo vs gateway)
+    topic_clean = topic.strip("/").lower()
+    parts = topic_clean.split("/")
+    is_device = False
+    is_gateway = False
+    if isinstance(parsed, dict):
+        if parsed.get("deviceInfo") or parsed.get("devEui") or "device" in topic_clean:
+            is_device = True
+        elif parsed.get("gatewayId") or "gateway" in topic_clean:
+            is_gateway = True
+        elif parsed.get("deduplicationId") or parsed.get("fCnt") is not None or parsed.get("devAddr"):
+            is_device = True
+
+    # Caso A: Eventos de aplicación/dispositivo en JSON
+    if parsed and is_device:
+        event_type = "up"
+        for candidate in ("up", "join", "status", "ack", "txack", "log", "location", "down"):
+            if candidate in parts or f"/{candidate}" in topic_clean or topic_clean.endswith(candidate):
+                event_type = candidate
+                break
+
         device_info = parsed.get("deviceInfo") or {}
         dev_eui = (device_info.get("devEui") or parsed.get("devEui") or "").strip().lower()
         if not dev_eui and "device" in parts:
@@ -298,6 +315,7 @@ def parse_chirpstack_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict
         event_log = {
             "id": str(parsed.get("deduplicationId") or uuid.uuid4()),
             "time": event_time,
+            "received_at": event_time.isoformat(),
             "event_type": event_type,
             "dev_eui": dev_eui,
             "device_name": device_name,
@@ -339,6 +357,7 @@ def parse_chirpstack_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict
             frame_log = {
                 "id": f"frm-{event_log['id']}",
                 "time": event_time,
+                "received_at": event_time.isoformat(),
                 "direction": direction,
                 "m_type": m_type,
                 "dev_eui": dev_eui,
@@ -407,8 +426,7 @@ def parse_chirpstack_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict
         }
 
     # Caso B: Mensajes de Gateway en JSON (stats, up, down)
-    if parsed and "/gateway/" in topic:
-        parts = topic.split("/")
+    if parsed and is_gateway:
         gw_id = str(parsed.get("gatewayId") or "").strip().lower()
         if not gw_id and "gateway" in parts:
             idx = parts.index("gateway")
@@ -431,10 +449,11 @@ def parse_chirpstack_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict
                 sf_val = int(lora_mod["spreadingFactor"]) if isinstance(lora_mod.get("spreadingFactor"), (int, float)) else None
                 bw_hz = lora_mod.get("bandwidth")
                 bw_khz = int(float(bw_hz) // 1000) if isinstance(bw_hz, (int, float)) and bw_hz > 0 else None
-                is_down = "/command/down" in topic
+                is_down = "/command/down" in topic or "down" in parts
                 frame_log = {
                     "id": f"gwfrm-{uuid.uuid4()}",
                     "time": now,
+                    "received_at": now.isoformat(),
                     "direction": "DOWNLINK" if is_down else "UPLINK",
                     "m_type": phy_info.get("m_type", "Downlink" if is_down else "Uplink"),
                     "dev_eui": phy_info.get("dev_eui"),

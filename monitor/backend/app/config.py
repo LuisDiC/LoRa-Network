@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     chirpstack_mqtt_host: str = "localhost"
     chirpstack_mqtt_port: int = 1883
     chirpstack_mqtt_user: str = ""
+    chirpstack_mqtt_username: str = ""
     chirpstack_mqtt_password: str = ""
     chirpstack_verify_ssl: bool = True
 

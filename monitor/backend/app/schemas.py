@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 CommState = Literal["ACTIVE", "NO_COMMUNICATION", "UNKNOWN"]
 AlarmSeverity = Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"]
@@ -245,8 +245,11 @@ class NodeMetadataDTO(BaseModel):
 
 
 class ChirpStackEventLogDTO(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: str
     time: datetime
+    received_at: Optional[datetime] = None
     event_type: str = Field(description="up, join, status, ack, txack, log, down, location")
     dev_eui: str
     device_name: str = ""
@@ -274,8 +277,11 @@ class ChirpStackEventLogDTO(BaseModel):
 
 
 class LoRaWANFrameLogDTO(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: str
     time: datetime
+    received_at: Optional[datetime] = None
     direction: Literal["UPLINK", "DOWNLINK"] = "UPLINK"
     m_type: str = Field(description="UnconfirmedDataUp, ConfirmedDataUp, JoinRequest, JoinAccept, UnconfirmedDataDown, ConfirmedDataDown")
     dev_eui: Optional[str] = None
