@@ -162,3 +162,9 @@ INSERT INTO alarm_rules (code, name, severity, threshold_value, tolerance_minute
 ('CHIRPSTACK_DISCONNECTED', 'Pérdida de conexión con ChirpStack', 'CRITICAL', 1, 0, TRUE),
 ('INTEGRATION_ERROR', 'Error técnico de integración ChirpStack', 'MEDIUM', 1, 0, TRUE)
 ON CONFLICT (code) DO NOTHING;
+
+
+-- Usuario administrador inicial con hash bcrypt (contraseña: demopassword)
+INSERT INTO users (username, full_name, role, password_hash, is_active) VALUES
+('operador.demo', 'Operador de Red', 'Administrador LoRaWAN', '$2b$12$K8yR2u/fR.hA7/rFqCqBde6x5Y3P7qRzWk0eIeP.0c8WzYv7rE1a.', TRUE)
+ON CONFLICT (username) DO NOTHING;

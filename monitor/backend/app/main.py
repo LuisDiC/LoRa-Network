@@ -12,9 +12,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
+from sqlalchemy import delete, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import hash_password, verify_password
+from app.auth import create_access_token, decode_access_token, hash_password, verify_password
 from app.config import settings
+from app.database import AsyncSessionLocal, get_db, init_db
+from app.models import User
 from app.schemas import (
     AlarmDTO,
     AlarmRuleUpdateDTO,
@@ -69,6 +73,12 @@ logger = logging.getLogger("lorawan_monitor.api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Inicialización de tablas y usuario administrador inicial en PostgreSQL
+    try:
+        await init_db_and_seed()
+    except Exception as e:
+        logger.warning("Fallo al inicializar tablas en PostgreSQL: %s", e)
+
     # Sincronización inmediata al arrancar el backend con ChirpStack
     try:
         await store.sync_from_chirpstack()
@@ -841,84 +851,111 @@ class RuntimeStore:
 
 store = RuntimeStore()
 
-USERS_FILE = Path("data/users.json")
+# ---------------------------------------------------------------------------
+# Gestión de Usuarios y Autenticación en PostgreSQL (Bcrypt + JWT)
+# Sin persistencia en archivos JSON para máxima seguridad
+# ---------------------------------------------------------------------------
 
-
-def load_users() -> Dict[str, Dict[str, Any]]:
-    default_users = {
-        "operador.demo": {
-            "username": "operador.demo",
-            "full_name": "Operador de Red",
-            "role": "Administrador LoRaWAN",
-            "password_sha256": hashlib.sha256("demopassword".encode()).hexdigest(),
-            "created_at": "2024-01-01T00:00:00Z",
-        }
+_in_memory_users: Dict[str, Dict[str, Any]] = {
+    "operador.demo": {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "username": "operador.demo",
+        "full_name": "Operador de Red",
+        "role": "Administrador LoRaWAN",
+        "password_hash": hash_password("demopassword"),
+        "is_active": True,
+        "allowed_tenant_ids": [],
+        "created_at": "2024-01-01T00:00:00Z",
     }
-    try:
-        if USERS_FILE.exists():
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict) and data:
-                    return data
-    except Exception as exc:
-        logger.warning("No se pudo cargar users.json: %s", exc)
-
-    save_users(default_users)
-    return default_users
+}
 
 
-def save_users(users: Dict[str, Dict[str, Any]]) -> None:
-    try:
-        USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(users, f, indent=2)
-    except Exception as exc:
-        logger.error("Error guardando users.json: %s", exc)
-
-
-USERS_DB = load_users()
-
-
-def verify_and_upgrade_password(user: Dict[str, Any], plain_password: str) -> bool:
+async def init_db_and_seed() -> None:
     """
-    Verifica la contraseña usando bcrypt (password_hash) o SHA-256 legacy (password_sha256).
-    Si coincide con un hash SHA-256 legacy, migra automáticamente a bcrypt con salt.
+    Inicializa las tablas de PostgreSQL e inserta el usuario 'operador.demo'
+    con hash bcrypt si aún no existe.
     """
-    bcrypt_hash = user.get("password_hash")
-    if bcrypt_hash:
-        try:
-            if verify_password(plain_password, bcrypt_hash):
-                return True
-        except Exception:
-            pass
-
-    legacy_sha = user.get("password_sha256")
-    if legacy_sha:
-        digest = hashlib.sha256(plain_password.encode()).hexdigest()
-        if hmac.compare_digest(legacy_sha, digest):
-            try:
-                user["password_hash"] = hash_password(plain_password)
-                save_users(USERS_DB)
-            except Exception:
-                pass
-            return True
-    return False
-
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, str]:
     try:
-        payload = jwt.decode(
-            credentials.credentials, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm]
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(User).where(User.username == "operador.demo")
+            )
+            demo = result.scalar_one_or_none()
+            if not demo:
+                demo = User(
+                    username="operador.demo",
+                    full_name="Operador de Red",
+                    role="Administrador LoRaWAN",
+                    password_hash=hash_password("demopassword"),
+                    is_active=True,
+                    allowed_tenant_ids=[],
+                )
+                session.add(demo)
+                await session.commit()
+                logger.info("PostgreSQL inicializado: usuario 'operador.demo' creado con hash bcrypt.")
+            else:
+                if not verify_password("demopassword", demo.password_hash):
+                    demo.password_hash = hash_password("demopassword")
+                    await session.commit()
+                    logger.info("Contraseña de 'operador.demo' sincronizada con bcrypt en PostgreSQL.")
+    except Exception as exc:
+        logger.warning(
+            "No se pudo conectar a PostgreSQL en init_db (%s). Operando con fallback en memoria (sin archivos JSON).",
+            exc,
         )
-        username: Optional[str] = payload.get("sub")
-        if not username or username not in USERS_DB:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido")
-        return USERS_DB[username]
-    except JWTError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión expirada") from exc
 
 
-def require_admin(current_user: Dict[str, str] = Depends(get_current_user)) -> Dict[str, str]:
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    if not payload or not payload.get("sub"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Sesión expirada o token inválido",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    username = str(payload["sub"]).strip().lower()
+
+    # 1. Consultar usuario activo en PostgreSQL
+    try:
+        result = await db.execute(
+            select(User).where(User.username == username, User.is_active == True)
+        )
+        user_db = result.scalar_one_or_none()
+        if user_db:
+            return {
+                "id": str(user_db.id),
+                "username": user_db.username,
+                "full_name": user_db.full_name,
+                "role": user_db.role,
+                "allowed_tenant_ids": user_db.allowed_tenant_ids or [],
+            }
+    except Exception as e:
+        logger.debug("Error consultando usuario en PostgreSQL (%s), verificando fallback...", e)
+
+    # 2. Fallback en memoria si la base de datos no está disponible
+    if username in _in_memory_users and _in_memory_users[username].get("is_active", True):
+        mem_u = _in_memory_users[username]
+        return {
+            "id": mem_u["id"],
+            "username": mem_u["username"],
+            "full_name": mem_u["full_name"],
+            "role": mem_u["role"],
+            "allowed_tenant_ids": mem_u.get("allowed_tenant_ids", []),
+        }
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Usuario no encontrado o cuenta desactivada",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     if current_user.get("role") != "Administrador LoRaWAN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -928,27 +965,83 @@ def require_admin(current_user: Dict[str, str] = Depends(get_current_user)) -> D
 
 
 @app.post("/auth/login", response_model=TokenResponse)
-async def login(req: LoginRequest) -> TokenResponse:
-    user = USERS_DB.get(req.username.strip().lower())
-    if not user or not verify_and_upgrade_password(user, req.password):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas")
+async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+    clean_username = req.username.strip().lower()
+    user_record = None
 
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_access_token_expire_minutes)
-    token = jwt.encode(
-        {"sub": user["username"], "exp": expire},
-        settings.jwt_secret_key,
-        algorithm=settings.jwt_algorithm,
-    )
-    return TokenResponse(
-        access_token=token,
-        user_full_name=user["full_name"],
-        role=user["role"],
-        demo_mode=settings.demo_mode,
-    )
+    # 1. Búsqueda en PostgreSQL
+    try:
+        result = await db.execute(
+            select(User).where(User.username == clean_username, User.is_active == True)
+        )
+        user_record = result.scalar_one_or_none()
+    except Exception as e:
+        logger.warning("Fallo al consultar login en PostgreSQL: %s", e)
+
+    # 2. Si existe en PostgreSQL, verificar hash bcrypt con salting automático
+    if user_record:
+        if not verify_password(req.password, user_record.password_hash):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas")
+        token = create_access_token({"sub": user_record.username})
+        return TokenResponse(
+            access_token=token,
+            user_full_name=user_record.full_name,
+            role=user_record.role,
+            demo_mode=settings.demo_mode,
+        )
+
+    # 3. Fallback en memoria si la base de datos estaba inaccesible
+    if clean_username in _in_memory_users and _in_memory_users[clean_username].get("is_active", True):
+        mem_u = _in_memory_users[clean_username]
+        if verify_password(req.password, mem_u["password_hash"]):
+            token = create_access_token({"sub": mem_u["username"]})
+            return TokenResponse(
+                access_token=token,
+                user_full_name=mem_u["full_name"],
+                role=mem_u["role"],
+                demo_mode=settings.demo_mode,
+            )
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas")
+
+
+@app.get("/auth/me")
+async def get_my_profile(current_user: Dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """
+    Retorna el perfil del usuario autenticado para validar tokens JWT en el inicio de la app móvil.
+    """
+    return {
+        "id": current_user.get("id"),
+        "username": current_user["username"],
+        "full_name": current_user["full_name"],
+        "role": current_user["role"],
+        "allowed_tenant_ids": current_user.get("allowed_tenant_ids", []),
+    }
 
 
 @app.get("/api/users", response_model=List[UserResponseDTO])
-async def list_users(_: Dict = Depends(get_current_user)) -> List[UserResponseDTO]:
+async def list_users(
+    _: Dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> List[UserResponseDTO]:
+    try:
+        result = await db.execute(
+            select(User).where(User.is_active == True).order_by(User.created_at)
+        )
+        users = result.scalars().all()
+        if users:
+            return [
+                UserResponseDTO(
+                    username=u.username,
+                    full_name=u.full_name,
+                    role=u.role,
+                    created_at=u.created_at.isoformat() if u.created_at else None,
+                )
+                for u in users
+            ]
+    except Exception as e:
+        logger.debug("Error listando usuarios desde PostgreSQL: %s", e)
+
     return [
         UserResponseDTO(
             username=u["username"],
@@ -956,7 +1049,8 @@ async def list_users(_: Dict = Depends(get_current_user)) -> List[UserResponseDT
             role=u["role"],
             created_at=u.get("created_at"),
         )
-        for u in USERS_DB.values()
+        for u in _in_memory_users.values()
+        if u.get("is_active", True)
     ]
 
 
@@ -964,42 +1058,76 @@ async def list_users(_: Dict = Depends(get_current_user)) -> List[UserResponseDT
 async def create_user(
     req: UserCreateRequest,
     current_user: Dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
 ) -> UserResponseDTO:
     clean_username = req.username.strip().lower()
-    if clean_username in USERS_DB:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"El nombre de usuario '{clean_username}' ya existe",
-        )
 
-    hashed_sha = hashlib.sha256(req.password.encode()).hexdigest()
+    # 1. Crear en PostgreSQL
     try:
-        hashed_bcrypt = hash_password(req.password)
-    except Exception:
-        hashed_bcrypt = ""
-    created_now = datetime.now(timezone.utc).isoformat()
+        res = await db.execute(select(User).where(User.username == clean_username))
+        if res.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"El nombre de usuario '{clean_username}' ya existe",
+            )
 
-    new_user = {
-        "username": clean_username,
-        "full_name": req.full_name.strip(),
-        "role": req.role.strip(),
-        "password_hash": hashed_bcrypt,
-        "password_sha256": hashed_sha,
-        "created_at": created_now,
-    }
-    USERS_DB[clean_username] = new_user
-    save_users(USERS_DB)
+        bcrypt_hash = hash_password(req.password)
+        new_user = User(
+            username=clean_username,
+            full_name=req.full_name.strip(),
+            role=req.role.strip(),
+            password_hash=bcrypt_hash,
+            is_active=True,
+            allowed_tenant_ids=[],
+        )
+        db.add(new_user)
+        await db.commit()
+        await db.refresh(new_user)
 
-    # Inicializar preferencias de notificaciones por defecto
-    store.get_user_prefs(clean_username)
-
-    logger.info("Usuario creado: %s por %s", clean_username, current_user.get("username"))
-    return UserResponseDTO(
-        username=new_user["username"],
-        full_name=new_user["full_name"],
-        role=new_user["role"],
-        created_at=new_user["created_at"],
-    )
+        _in_memory_users[clean_username] = {
+            "id": str(new_user.id),
+            "username": clean_username,
+            "full_name": new_user.full_name,
+            "role": new_user.role,
+            "password_hash": bcrypt_hash,
+            "is_active": True,
+            "created_at": new_user.created_at.isoformat() if new_user.created_at else None,
+        }
+        store.get_user_prefs(clean_username)
+        logger.info("Usuario creado en PostgreSQL: %s por %s", clean_username, current_user.get("username"))
+        return UserResponseDTO(
+            username=new_user.username,
+            full_name=new_user.full_name,
+            role=new_user.role,
+            created_at=new_user.created_at.isoformat() if new_user.created_at else None,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("Fallo al guardar usuario en PostgreSQL (%s), guardando en memoria de sesión...", e)
+        if clean_username in _in_memory_users:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"El nombre de usuario '{clean_username}' ya existe",
+            )
+        bcrypt_hash = hash_password(req.password)
+        now_str = datetime.now(timezone.utc).isoformat()
+        _in_memory_users[clean_username] = {
+            "id": str(uuid.uuid4()),
+            "username": clean_username,
+            "full_name": req.full_name.strip(),
+            "role": req.role.strip(),
+            "password_hash": bcrypt_hash,
+            "is_active": True,
+            "created_at": now_str,
+        }
+        store.get_user_prefs(clean_username)
+        return UserResponseDTO(
+            username=clean_username,
+            full_name=req.full_name.strip(),
+            role=req.role.strip(),
+            created_at=now_str,
+        )
 
 
 @app.put("/api/users/{username}/password")
@@ -1007,24 +1135,36 @@ async def change_user_password(
     username: str,
     req: UserPasswordChangeRequest,
     current_user: Dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> Dict[str, str]:
     clean_username = username.strip().lower()
-    if clean_username not in USERS_DB:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado")
-
     if current_user["username"] != clean_username and current_user.get("role") != "Administrador LoRaWAN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No tienes permiso para modificar la contraseña de este usuario",
         )
 
-    USERS_DB[clean_username]["password_sha256"] = hashlib.sha256(req.new_password.encode()).hexdigest()
+    new_hash = hash_password(req.new_password)
+    updated = False
+
     try:
-        USERS_DB[clean_username]["password_hash"] = hash_password(req.new_password)
-    except Exception:
-        pass
-    save_users(USERS_DB)
-    logger.info("Contraseña actualizada para usuario: %s", clean_username)
+        res = await db.execute(select(User).where(User.username == clean_username))
+        user_db = res.scalar_one_or_none()
+        if user_db:
+            user_db.password_hash = new_hash
+            await db.commit()
+            updated = True
+    except Exception as e:
+        logger.warning("Fallo al actualizar contraseña en PostgreSQL: %s", e)
+
+    if clean_username in _in_memory_users:
+        _in_memory_users[clean_username]["password_hash"] = new_hash
+        updated = True
+
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado")
+
+    logger.info("Contraseña actualizada exitosamente con bcrypt para usuario: %s", clean_username)
     return {"message": f"Contraseña actualizada exitosamente para '{clean_username}'"}
 
 
@@ -1032,6 +1172,7 @@ async def change_user_password(
 async def delete_user(
     username: str,
     current_user: Dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> None:
     if current_user.get("role") != "Administrador LoRaWAN":
         raise HTTPException(
@@ -1046,11 +1187,24 @@ async def delete_user(
             detail="No puedes eliminar tu propia cuenta en sesión activa",
         )
 
-    if clean_username not in USERS_DB:
+    deleted = False
+    try:
+        res = await db.execute(select(User).where(User.username == clean_username))
+        user_db = res.scalar_one_or_none()
+        if user_db:
+            await db.delete(user_db)
+            await db.commit()
+            deleted = True
+    except Exception as e:
+        logger.warning("Fallo al eliminar usuario en PostgreSQL: %s", e)
+
+    if clean_username in _in_memory_users:
+        del _in_memory_users[clean_username]
+        deleted = True
+
+    if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado")
 
-    del USERS_DB[clean_username]
-    save_users(USERS_DB)
     logger.info("Usuario eliminado: %s por %s", clean_username, current_user.get("username"))
 
 
@@ -2135,12 +2289,13 @@ async def remove_push_token(
 async def websocket_updates(websocket: WebSocket, token: Optional[str] = Query(default=None)) -> None:
     if token:
         try:
-            payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
-            if not payload.get("sub") or payload.get("sub") not in USERS_DB:
+            payload = decode_access_token(token)
+            if not payload or not payload.get("sub"):
                 await websocket.close(code=1008)
                 return
-        except JWTError:
+        except Exception:
             await websocket.close(code=1008)
+            return
             return
     await websocket.accept()
     store.ws_clients.append(websocket)
