@@ -1,2 +1,5 @@
 monitor/.env
-chirpstack\configuration\mosquitto\config\passwd
+chirpstack/configuration/mosquitto/config/passwd
+monitor/backend/data/*.json
+**/__pycache__/
+*.pyc

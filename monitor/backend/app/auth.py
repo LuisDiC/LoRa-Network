@@ -1,44 +1,46 @@
 """
 Utilidades de autenticación JWT y hashing de contraseñas.
 Provee:
-  - hash_password()       — bcrypt via passlib
-  - verify_password()     — verificación constante-time de bcrypt
+  - hash_password()       — bcrypt nativo con truncamiento seguro a 72 bytes
+  - verify_password()     — verificación nativa de bcrypt en tiempo constante
   - create_access_token() — genera JWT firmado con settings.jwt_secret_key
   - decode_access_token() — decodifica y valida JWT; retorna None si inválido
 """
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.config import settings
 
-# ---------------------------------------------------------------------------
-# Contexto de hashing — bcrypt con auto-deprecation de esquemas débiles
-# ---------------------------------------------------------------------------
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 # ---------------------------------------------------------------------------
-# Hashing de contraseñas
+# Hashing de contraseñas con bcrypt nativo
 # ---------------------------------------------------------------------------
 
 def hash_password(plain: str) -> str:
     """
     Genera el hash bcrypt de la contraseña en texto plano.
-    El hash incluye el salt internamente (trabajo factor 12 por defecto en passlib).
+    Bcrypt limita internamente la entrada a 72 bytes; se trunca de forma segura a 72 bytes UTF-8.
     """
-    return _pwd_context.hash(plain)
+    pwd_bytes = plain.encode("utf-8")[:72]
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
     """
     Compara una contraseña en texto plano con su hash bcrypt.
-    Usa comparación en tiempo constante para mitigar timing attacks.
-    Retorna True si coinciden, False en cualquier otro caso.
+    Usa bcrypt.checkpw para comparación segura en tiempo constante.
+    Retorna True si coinciden, False en cualquier otro caso (o si el hash es inválido).
     """
-    return _pwd_context.verify(plain, hashed)
+    try:
+        pwd_bytes = plain.encode("utf-8")[:72]
+        hashed_bytes = hashed.encode("utf-8")
+        return bcrypt.checkpw(pwd_bytes, hashed_bytes)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------

@@ -862,7 +862,7 @@ _in_memory_users: Dict[str, Dict[str, Any]] = {
         "username": "operador.demo",
         "full_name": "Operador de Red",
         "role": "Administrador LoRaWAN",
-        "password_hash": hash_password("demopassword"),
+        "password_hash": "$2b$12$tQmDDa29RFvNffxpeMQKJOiP8NX4r06cagMY3gyVbpRHTclgkDvkm",
         "is_active": True,
         "allowed_tenant_ids": [],
         "created_at": "2024-01-01T00:00:00Z",
