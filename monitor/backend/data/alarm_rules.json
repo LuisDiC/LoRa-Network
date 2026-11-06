@@ -2,8 +2,8 @@
   "NODE_SILENT": {
     "code": "NODE_SILENT",
     "severity": "CRITICAL",
-    "threshold_value": 45,
-    "unit": "seconds",
+    "threshold_value": 30,
+    "unit": "minutes",
     "tolerance_minutes": 0,
     "is_enabled": true
   },
@@ -28,6 +28,30 @@
     "severity": "CRITICAL",
     "threshold_value": 1,
     "unit": "minutes",
+    "tolerance_minutes": 0,
+    "is_enabled": true
+  },
+  "GATEWAY_DATA_LIMIT": {
+    "code": "GATEWAY_DATA_LIMIT",
+    "severity": "HIGH",
+    "threshold_value": 80,
+    "unit": "%",
+    "tolerance_minutes": 0,
+    "is_enabled": true
+  },
+  "GATEWAY_RECHARGE_EXPIRING": {
+    "code": "GATEWAY_RECHARGE_EXPIRING",
+    "severity": "MEDIUM",
+    "threshold_value": 3,
+    "unit": "days",
+    "tolerance_minutes": 0,
+    "is_enabled": true
+  },
+  "GATEWAY_RECHARGE_EXPIRED": {
+    "code": "GATEWAY_RECHARGE_EXPIRED",
+    "severity": "HIGH",
+    "threshold_value": 0,
+    "unit": "days",
     "tolerance_minutes": 0,
     "is_enabled": true
   }

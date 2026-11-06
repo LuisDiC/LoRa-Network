@@ -34,6 +34,10 @@ from app.schemas import (
     DeviceUpdateRequest,
     GatewayAlertConfigDTO,
     GatewayAlertConfigUpdateDTO,
+    GatewayCellularConfigDTO,
+    GatewayCellularRechargeDTO,
+    GatewayCellularStatusDTO,
+    GatewayCellularUpdateDTO,
     GatewayCreateRequest,
     GatewayMetadataDTO,
     GatewayUpdateRequest,
@@ -202,8 +206,10 @@ class RuntimeStore:
         self.custom_locations: Dict[str, Dict[str, float]] = self._load_custom_locations()
         self.node_alerts_file = Path("data/node_alerts.json")
         self.gw_alerts_file = Path("data/gateway_alerts.json")
+        self.gw_cellular_file = Path("data/gateway_cellular.json")
         self.node_alerts: Dict[str, Dict[str, Any]] = self._load_node_alerts()
         self.gw_alerts: Dict[str, Dict[str, Any]] = self._load_gw_alerts()
+        self.gw_cellular: Dict[str, Dict[str, Any]] = self._load_gw_cellular()
         self.rf_logs_file = Path("data/rf_logs.json")
         self.node_rf_metrics: Dict[str, Dict[str, Any]] = {}
         self.device_events: List[Dict[str, Any]] = []
@@ -235,16 +241,60 @@ class RuntimeStore:
     def _load_rules(self) -> Dict[str, AlarmRuleUpdateDTO]:
         defaults = {
             "NODE_SILENT": AlarmRuleUpdateDTO(
-                code="NODE_SILENT", severity="CRITICAL", threshold_value=45, unit="seconds", tolerance_minutes=0, is_enabled=True
+                code="NODE_SILENT",
+                severity="CRITICAL",
+                threshold_value=settings.default_node_silent_minutes or 30,
+                unit="minutes",
+                tolerance_minutes=0,
+                is_enabled=True,
             ),
             "GATEWAY_OFFLINE": AlarmRuleUpdateDTO(
-                code="GATEWAY_OFFLINE", severity="HIGH", threshold_value=15, unit="minutes", tolerance_minutes=2, is_enabled=True
+                code="GATEWAY_OFFLINE",
+                severity="HIGH",
+                threshold_value=settings.default_gateway_silent_minutes or 15,
+                unit="minutes",
+                tolerance_minutes=2,
+                is_enabled=True,
             ),
             "LOW_BATTERY": AlarmRuleUpdateDTO(
-                code="LOW_BATTERY", severity="HIGH", threshold_value=15, unit="%", tolerance_minutes=0, is_enabled=True
+                code="LOW_BATTERY",
+                severity="HIGH",
+                threshold_value=settings.default_low_battery_percent or 15,
+                unit="%",
+                tolerance_minutes=0,
+                is_enabled=True,
             ),
             "CHIRPSTACK_DISCONNECTED": AlarmRuleUpdateDTO(
-                code="CHIRPSTACK_DISCONNECTED", severity="CRITICAL", threshold_value=1, unit="minutes", tolerance_minutes=0, is_enabled=True
+                code="CHIRPSTACK_DISCONNECTED",
+                severity="CRITICAL",
+                threshold_value=1,
+                unit="minutes",
+                tolerance_minutes=0,
+                is_enabled=True,
+            ),
+            "GATEWAY_DATA_LIMIT": AlarmRuleUpdateDTO(
+                code="GATEWAY_DATA_LIMIT",
+                severity="HIGH",
+                threshold_value=80,
+                unit="%",
+                tolerance_minutes=0,
+                is_enabled=True,
+            ),
+            "GATEWAY_RECHARGE_EXPIRING": AlarmRuleUpdateDTO(
+                code="GATEWAY_RECHARGE_EXPIRING",
+                severity="MEDIUM",
+                threshold_value=3,
+                unit="days",
+                tolerance_minutes=0,
+                is_enabled=True,
+            ),
+            "GATEWAY_RECHARGE_EXPIRED": AlarmRuleUpdateDTO(
+                code="GATEWAY_RECHARGE_EXPIRED",
+                severity="HIGH",
+                threshold_value=0,
+                unit="days",
+                tolerance_minutes=0,
+                is_enabled=True,
             ),
         }
         try:
@@ -254,7 +304,12 @@ class RuntimeStore:
                     if isinstance(raw, dict):
                         for k, v in raw.items():
                             if isinstance(v, dict):
-                                defaults[k] = AlarmRuleUpdateDTO(**v)
+                                dto = AlarmRuleUpdateDTO(**v)
+                                # Prevenir que umbrales residuales de prueba (<=60 segundos) causen falsos positivos en nodos
+                                if k == "NODE_SILENT" and dto.unit == "seconds" and dto.threshold_value <= 60:
+                                    dto.unit = "minutes"
+                                    dto.threshold_value = settings.default_node_silent_minutes or 30
+                                defaults[k] = dto
         except Exception as e:
             logger.warning("No se pudo cargar alarm_rules.json: %s", e)
         return defaults
@@ -337,6 +392,98 @@ class RuntimeStore:
         except Exception as e:
             logger.error("Error guardando gateway_alerts.json: %s", e)
 
+    def _load_gw_cellular(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            if self.gw_cellular_file.exists():
+                with open(self.gw_cellular_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return {str(k).lower(): dict(v) for k, v in data.items() if isinstance(v, dict)}
+        except Exception as e:
+            logger.warning("No se pudo cargar gateway_cellular.json: %s", e)
+        return {}
+
+    def _save_gw_cellular(self) -> None:
+        try:
+            self.gw_cellular_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.gw_cellular_file, "w", encoding="utf-8") as f:
+                json.dump(self.gw_cellular, f, indent=2)
+        except Exception as e:
+            logger.error("Error guardando gateway_cellular.json: %s", e)
+
+    def get_gateway_cellular_status(self, gateway_id: str) -> GatewayCellularStatusDTO:
+        clean_id = gateway_id.strip().lower()
+        cfg = self.gw_cellular.get(clean_id) or {}
+        enabled = bool(cfg.get("enabled", False))
+        carrier = str(cfg.get("carrier") or "Telcel")
+        phone_number = cfg.get("phone_number")
+        sim_iccid = cfg.get("sim_iccid")
+        plan_mb = float(cfg.get("data_plan_mb", 1000.0))
+        consumed_mb = round(float(cfg.get("consumed_mb", 0.0)), 2)
+        remaining_mb = max(0.0, round(plan_mb - consumed_mb, 2))
+        percent_used = round((consumed_mb / plan_mb * 100.0) if plan_mb > 0 else 0.0, 1)
+        last_recharge_date = cfg.get("last_recharge_date")
+        validity_days = int(cfg.get("validity_days", 30))
+        alert_percent = int(cfg.get("alert_percent", 80))
+        alert_days_before = int(cfg.get("alert_days_before", 3))
+
+        expires_at_str = None
+        days_remaining = None
+        if last_recharge_date:
+            try:
+                date_rec = datetime.strptime(last_recharge_date, "%Y-%m-%d").date()
+                exp_date = date_rec + timedelta(days=validity_days)
+                expires_at_str = exp_date.strftime("%Y-%m-%d")
+                today = datetime.now(timezone.utc).date()
+                days_remaining = (exp_date - today).days
+            except Exception:
+                pass
+
+        is_expired = (days_remaining is not None and days_remaining < 0)
+        is_expiring_soon = (days_remaining is not None and 0 <= days_remaining <= alert_days_before)
+        is_data_exhausted = (consumed_mb >= plan_mb)
+        is_data_limit_near = (percent_used >= alert_percent and not is_data_exhausted)
+
+        if not enabled:
+            status_label = "Sin paquete móvil configurado"
+            status_tone = "neutral"
+        elif is_expired:
+            status_label = f"Recarga vencida (hace {abs(days_remaining)}d)"
+            status_tone = "danger"
+        elif is_data_exhausted:
+            status_label = "Datos agotados (100% consumido)"
+            status_tone = "danger"
+        elif is_expiring_soon:
+            status_label = f"Recarga por vencer (quedan {days_remaining}d)"
+            status_tone = "warning"
+        elif is_data_limit_near:
+            status_label = f"Consumo elevado ({percent_used}% usado)"
+            status_tone = "warning"
+        else:
+            status_label = f"Vigente ({remaining_mb:.1f} MB disponibles)"
+            status_tone = "success"
+
+        return GatewayCellularStatusDTO(
+            enabled=enabled,
+            carrier=carrier,
+            phone_number=phone_number,
+            sim_iccid=sim_iccid,
+            data_plan_mb=plan_mb,
+            consumed_mb=consumed_mb,
+            remaining_mb=remaining_mb,
+            percent_used=percent_used,
+            last_recharge_date=last_recharge_date,
+            expires_at=expires_at_str,
+            validity_days=validity_days,
+            days_remaining=days_remaining,
+            is_expired=is_expired,
+            is_expiring_soon=is_expiring_soon,
+            is_data_limit_near=is_data_limit_near,
+            is_data_exhausted=is_data_exhausted,
+            status_label=status_label,
+            status_tone=status_tone,
+        )
+
     def _load_rf_logs(self) -> None:
         try:
             if self.rf_logs_file.exists():
@@ -384,7 +531,7 @@ class RuntimeStore:
         if dev_eui:
             for n in self.raw_nodes:
                 if n["dev_eui"].lower() == dev_eui:
-                    n["last_seen_at"] = parsed.get("last_seen_at") or parsed.get("received_at") or now
+                    n["last_seen_at"] = now
                     if parsed.get("battery_level") is not None:
                         n["battery_level"] = parsed["battery_level"]
                     if parsed.get("external_power") is not None:
@@ -424,7 +571,7 @@ class RuntimeStore:
         if gw_id:
             for g in self.raw_gateways:
                 if g["gateway_id"].lower() == gw_id:
-                    g["last_seen_at"] = parsed.get("last_seen_at") or parsed.get("received_at") or now
+                    g["last_seen_at"] = now
                     break
 
         event_log = parsed.get("event_log")
@@ -479,6 +626,35 @@ class RuntimeStore:
                 self.lorawan_frames.insert(0, frame_log)
                 self.lorawan_frames = self.lorawan_frames[:300]
 
+        # Contabilización automática de tráfico móvil celular por Gateway (SIM 4G)
+        cellular_traffic_changed = False
+        target_gw_ids = set()
+        if gw_id:
+            target_gw_ids.add(gw_id)
+        for rx in (parsed.get("rx_gateways") or []):
+            gid = (rx.get("gateway_id") or "").strip().lower()
+            if gid:
+                target_gw_ids.add(gid)
+
+        pkg_bytes = 0
+        if parsed.get("frame_log"):
+            fl = parsed["frame_log"]
+            d_len = len(fl.get("data_hex") or "") // 2
+            pkg_bytes = max(30, d_len) + 220  # Payload + IP/UDP/TLS overhead
+        elif parsed.get("kind") == "GATEWAY_STATE":
+            pkg_bytes = 650  # Keepalive / Stats packet overhead
+
+        if pkg_bytes > 0 and target_gw_ids:
+            mb_delta = pkg_bytes / (1024.0 * 1024.0)
+            for gid in target_gw_ids:
+                if gid in self.gw_cellular and self.gw_cellular[gid].get("enabled"):
+                    curr_mb = float(self.gw_cellular[gid].get("consumed_mb") or 0.0)
+                    self.gw_cellular[gid]["consumed_mb"] = round(curr_mb + mb_delta, 4)
+                    cellular_traffic_changed = True
+
+        if cellular_traffic_changed:
+            self._save_gw_cellular()
+
         self._save_rf_logs()
         self.evaluate_all()
 
@@ -514,6 +690,8 @@ class RuntimeStore:
             apps_all: List[Dict] = []
             nodes_all: List[Dict] = []
             tenant_map = {t["tenant_id"]: t["name"] for t in tenants}
+            existing_nodes_map = {n["dev_eui"].lower(): n for n in self.raw_nodes}
+            existing_gateways_map = {g["gateway_id"].lower(): g for g in self.raw_gateways}
 
             for t in tenants:
                 tid = t["tenant_id"]
@@ -527,6 +705,20 @@ class RuntimeStore:
                         d["application_name"] = a["name"]
                         d["tenant_name"] = tname
                         dev_eui_lower = d["dev_eui"].lower()
+                        existing_node = existing_nodes_map.get(dev_eui_lower)
+                        if existing_node:
+                            # Preservar el last_seen_at más reciente para evitar que la API REST
+                            # retrase la última actividad registrada por MQTT en vivo
+                            ex_ls = existing_node.get("last_seen_at")
+                            d_ls = d.get("last_seen_at")
+                            if ex_ls is not None:
+                                if d_ls is None or ex_ls > d_ls:
+                                    d["last_seen_at"] = ex_ls
+                            if d.get("battery_level") is None and existing_node.get("battery_level") is not None:
+                                d["battery_level"] = existing_node["battery_level"]
+                            if d.get("external_power") is None and existing_node.get("external_power") is not None:
+                                d["external_power"] = existing_node["external_power"]
+
                         rf_cur = self.node_rf_metrics.get(dev_eui_lower, {})
                         if d.get("last_seen_at") and rf_cur.get("rssi") is None:
                             try:
@@ -545,6 +737,14 @@ class RuntimeStore:
             for g in gateways:
                 tid = g.get("tenant_id")
                 g["tenant_name"] = tenant_map.get(tid, "No asignado")
+                gw_id_lower = g["gateway_id"].lower()
+                existing_gw = existing_gateways_map.get(gw_id_lower)
+                if existing_gw:
+                    ex_gw_ls = existing_gw.get("last_seen_at")
+                    g_ls = g.get("last_seen_at")
+                    if ex_gw_ls is not None:
+                        if g_ls is None or ex_gw_ls > g_ls:
+                            g["last_seen_at"] = ex_gw_ls
 
             self.tenants = tenants
             self.applications = apps_all
@@ -796,6 +996,92 @@ class RuntimeStore:
                     "GATEWAY_OFFLINE", "GATEWAY", gw["gateway_id"], "Gateway nuevamente en línea", now
                 )
 
+            # Evaluación de datos móviles y paquete celular (SIM 4G)
+            cell_stat = self.get_gateway_cellular_status(gw["gateway_id"])
+            if cell_stat.enabled:
+                cell_cfg = self.gw_cellular.get(gw_id_lower) or {}
+                # 1. Alarma por sobreconsumo de datos
+                if cell_stat.is_data_exhausted or cell_stat.is_data_limit_near:
+                    al, is_new = alarm_engine.trigger_or_update(
+                        rule_code="GATEWAY_DATA_LIMIT",
+                        severity="CRITICAL" if cell_stat.is_data_exhausted else "HIGH",
+                        entity_type="GATEWAY",
+                        entity_id=gw["gateway_id"],
+                        entity_name=gw["name"],
+                        title="Consumo crítico de datos móviles",
+                        condition_description=(
+                            f"El gateway ha consumido {cell_stat.consumed_mb:.1f} MB de su plan de {cell_stat.data_plan_mb:.1f} MB ({cell_stat.percent_used}%)."
+                        ),
+                        observed_value=f"{cell_stat.percent_used}% ({cell_stat.consumed_mb:.1f}/{cell_stat.data_plan_mb:.1f} MB)",
+                        threshold_formatted=f"{cell_cfg.get('alert_percent', 80)}%",
+                        last_activity_at=gw["last_seen_at"],
+                        now=now,
+                    )
+                    if is_new and al:
+                        newly_triggered.append(al)
+                else:
+                    alarm_engine.resolve_if_recovered(
+                        "GATEWAY_DATA_LIMIT", "GATEWAY", gw["gateway_id"], "Consumo de datos dentro de límites", now
+                    )
+
+                # 2. Alarma por paquete móvil expirado
+                if cell_stat.is_expired:
+                    al, is_new = alarm_engine.trigger_or_update(
+                        rule_code="GATEWAY_RECHARGE_EXPIRED",
+                        severity="HIGH",
+                        entity_type="GATEWAY",
+                        entity_id=gw["gateway_id"],
+                        entity_name=gw["name"],
+                        title="Paquete móvil de datos vencido",
+                        condition_description=(
+                            f"El paquete de datos móviles expiró el {cell_stat.expires_at} (hace {abs(cell_stat.days_remaining or 0)} días). Realice una recarga."
+                        ),
+                        observed_value=f"Vencido hace {abs(cell_stat.days_remaining or 0)} días",
+                        threshold_formatted="Vigente",
+                        last_activity_at=gw["last_seen_at"],
+                        now=now,
+                    )
+                    if is_new and al:
+                        newly_triggered.append(al)
+                else:
+                    alarm_engine.resolve_if_recovered(
+                        "GATEWAY_RECHARGE_EXPIRED", "GATEWAY", gw["gateway_id"], "Paquete móvil vigente", now
+                    )
+
+                # 3. Alarma por recarga por vencer próximamente
+                if cell_stat.is_expiring_soon:
+                    al, is_new = alarm_engine.trigger_or_update(
+                        rule_code="GATEWAY_RECHARGE_EXPIRING",
+                        severity="MEDIUM",
+                        entity_type="GATEWAY",
+                        entity_id=gw["gateway_id"],
+                        entity_name=gw["name"],
+                        title="Recarga móvil por vencer",
+                        condition_description=(
+                            f"El paquete de datos móviles vence en {cell_stat.days_remaining} días (Vence el {cell_stat.expires_at})."
+                        ),
+                        observed_value=f"Quedan {cell_stat.days_remaining} días",
+                        threshold_formatted=f"Alerta ≤ {cell_cfg.get('alert_days_before', 3)} días",
+                        last_activity_at=gw["last_seen_at"],
+                        now=now,
+                    )
+                    if is_new and al:
+                        newly_triggered.append(al)
+                elif not cell_stat.is_expired:
+                    alarm_engine.resolve_if_recovered(
+                        "GATEWAY_RECHARGE_EXPIRING", "GATEWAY", gw["gateway_id"], "Recarga vigente con tiempo suficiente", now
+                    )
+            else:
+                alarm_engine.resolve_if_recovered(
+                    "GATEWAY_DATA_LIMIT", "GATEWAY", gw["gateway_id"], "Supervisión celular inactiva", now
+                )
+                alarm_engine.resolve_if_recovered(
+                    "GATEWAY_RECHARGE_EXPIRED", "GATEWAY", gw["gateway_id"], "Supervisión celular inactiva", now
+                )
+                alarm_engine.resolve_if_recovered(
+                    "GATEWAY_RECHARGE_EXPIRING", "GATEWAY", gw["gateway_id"], "Supervisión celular inactiva", now
+                )
+
             gw_alarms = [
                 a
                 for a in alarm_engine.active_alarms.values()
@@ -819,6 +1105,7 @@ class RuntimeStore:
                     longitude=gw["longitude"] if has_loc else None,
                     location_display=loc_display,
                     has_active_alarm=bool(gw_alarms),
+                    cellular=cell_stat,
                 )
             )
 
@@ -1208,6 +1495,20 @@ async def delete_user(
     logger.info("Usuario eliminado: %s por %s", clean_username, current_user.get("username"))
 
 
+@app.get("/api/health")
+async def health_check() -> Dict[str, Any]:
+    """Diagnóstico de hora del servidor y estado del servicio."""
+    now_utc = datetime.now(timezone.utc)
+    now_gdl = now_utc - timedelta(hours=6)
+    return {
+        "status": "ok",
+        "server_time_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "server_time_guadalajara": now_gdl.strftime("%Y-%m-%d %H:%M:%S (UTC-6)"),
+        "chirpstack_connected": store.chirpstack_connected,
+        "chirpstack_status": store.chirpstack_status_detail,
+    }
+
+
 @app.get("/api/dashboard", response_model=DashboardSummaryDTO)
 @app.get("/api/dashboard/summary", response_model=DashboardSummaryDTO)
 async def get_dashboard(_: Dict = Depends(get_current_user)) -> DashboardSummaryDTO:
@@ -1491,6 +1792,9 @@ async def delete_gateway(
         if clean_id in store.gw_alerts:
             del store.gw_alerts[clean_id]
             store._save_gw_alerts()
+        if clean_id in store.gw_cellular:
+            del store.gw_cellular[clean_id]
+            store._save_gw_cellular()
         await store.sync_from_chirpstack()
     except Exception as exc:
         logger.error("Error eliminando gateway en ChirpStack: %s", exc)
@@ -1884,6 +2188,146 @@ async def update_gateway_alerts(
         offline_seconds=current["offline_seconds"],
         offline_enabled=current["offline_enabled"],
     )
+
+
+@app.get("/api/gateways/{gateway_id}/cellular", response_model=Dict[str, Any])
+async def get_gateway_cellular(gateway_id: str, _: Dict = Depends(get_current_user)) -> Dict[str, Any]:
+    clean_id = gateway_id.strip().lower()
+    cfg = store.gw_cellular.get(clean_id) or {
+        "gateway_id": clean_id,
+        "enabled": False,
+        "carrier": "Telcel",
+        "phone_number": "",
+        "sim_iccid": "",
+        "data_plan_mb": 1000.0,
+        "consumed_mb": 0.0,
+        "last_recharge_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "validity_days": 30,
+        "alert_percent": 80,
+        "alert_days_before": 3,
+        "notes": "",
+    }
+    status = store.get_gateway_cellular_status(clean_id)
+    return {
+        "config": GatewayCellularConfigDTO(
+            gateway_id=clean_id,
+            enabled=bool(cfg.get("enabled", False)),
+            carrier=str(cfg.get("carrier") or "Telcel"),
+            phone_number=cfg.get("phone_number"),
+            sim_iccid=cfg.get("sim_iccid"),
+            data_plan_mb=float(cfg.get("data_plan_mb", 1000.0)),
+            consumed_mb=float(cfg.get("consumed_mb", 0.0)),
+            last_recharge_date=cfg.get("last_recharge_date"),
+            validity_days=int(cfg.get("validity_days", 30)),
+            alert_percent=int(cfg.get("alert_percent", 80)),
+            alert_days_before=int(cfg.get("alert_days_before", 3)),
+            notes=cfg.get("notes"),
+        ),
+        "status": status,
+    }
+
+
+@app.put("/api/gateways/{gateway_id}/cellular", response_model=Dict[str, Any])
+async def update_gateway_cellular(
+    gateway_id: str,
+    req: GatewayCellularUpdateDTO,
+    _: Dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    clean_id = gateway_id.strip().lower()
+    current = store.gw_cellular.get(clean_id) or {
+        "gateway_id": clean_id,
+        "enabled": False,
+        "carrier": "Telcel",
+        "phone_number": "",
+        "sim_iccid": "",
+        "data_plan_mb": 1000.0,
+        "consumed_mb": 0.0,
+        "last_recharge_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "validity_days": 30,
+        "alert_percent": 80,
+        "alert_days_before": 3,
+        "notes": "",
+    }
+    if req.enabled is not None:
+        current["enabled"] = req.enabled
+    if req.carrier is not None:
+        current["carrier"] = req.carrier.strip()
+    if req.phone_number is not None:
+        current["phone_number"] = req.phone_number.strip()
+    if req.sim_iccid is not None:
+        current["sim_iccid"] = req.sim_iccid.strip()
+    if req.data_plan_mb is not None:
+        current["data_plan_mb"] = float(req.data_plan_mb)
+    if req.consumed_mb is not None:
+        current["consumed_mb"] = float(req.consumed_mb)
+    if req.last_recharge_date is not None:
+        current["last_recharge_date"] = req.last_recharge_date.strip()
+    if req.validity_days is not None:
+        current["validity_days"] = req.validity_days
+    if req.alert_percent is not None:
+        current["alert_percent"] = req.alert_percent
+    if req.alert_days_before is not None:
+        current["alert_days_before"] = req.alert_days_before
+    if req.notes is not None:
+        current["notes"] = req.notes.strip()
+
+    store.gw_cellular[clean_id] = current
+    store._save_gw_cellular()
+    store.evaluate_all()
+    return await get_gateway_cellular(gateway_id, _)
+
+
+@app.post("/api/gateways/{gateway_id}/cellular/recharge", response_model=Dict[str, Any])
+async def register_gateway_recharge(
+    gateway_id: str,
+    req: GatewayCellularRechargeDTO,
+    _: Dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    clean_id = gateway_id.strip().lower()
+    current = store.gw_cellular.get(clean_id) or {
+        "gateway_id": clean_id,
+        "enabled": True,
+        "carrier": "Telcel",
+        "phone_number": "",
+        "sim_iccid": "",
+        "data_plan_mb": 1000.0,
+        "consumed_mb": 0.0,
+        "last_recharge_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "validity_days": 30,
+        "alert_percent": 80,
+        "alert_days_before": 3,
+        "notes": "",
+    }
+    recharge_date_str = req.recharge_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    current["last_recharge_date"] = recharge_date_str
+    if req.validity_days is not None:
+        current["validity_days"] = req.validity_days
+    if req.new_data_plan_mb is not None:
+        current["data_plan_mb"] = float(req.new_data_plan_mb)
+    if req.reset_consumed:
+        current["consumed_mb"] = float(req.initial_consumed_mb or 0.0)
+
+    current["enabled"] = True
+    store.gw_cellular[clean_id] = current
+    store._save_gw_cellular()
+    store.evaluate_all()
+    logger.info("Recarga móvil registrada para gateway %s: fecha=%s, vigencia=%d días, plan=%.1f MB",
+                clean_id, recharge_date_str, current["validity_days"], current["data_plan_mb"])
+    return await get_gateway_cellular(gateway_id, _)
+
+
+@app.post("/api/gateways/{gateway_id}/cellular/reset-counter", response_model=Dict[str, Any])
+async def reset_gateway_cellular_counter(
+    gateway_id: str,
+    reset_to_mb: float = Query(default=0.0, ge=0.0),
+    _: Dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    clean_id = gateway_id.strip().lower()
+    if clean_id in store.gw_cellular:
+        store.gw_cellular[clean_id]["consumed_mb"] = float(reset_to_mb)
+        store._save_gw_cellular()
+        store.evaluate_all()
+    return await get_gateway_cellular(gateway_id, _)
 
 
 @app.get("/api/nodes", response_model=List[NodeMetadataDTO])

@@ -310,6 +310,64 @@ class LoRaWANFrameLogDTO(BaseModel):
     frame_details: Dict[str, Any] = Field(default_factory=dict)
 
 
+class GatewayCellularStatusDTO(BaseModel):
+    enabled: bool = False
+    carrier: str = "Telcel"
+    phone_number: Optional[str] = None
+    sim_iccid: Optional[str] = None
+    data_plan_mb: float = 1000.0
+    consumed_mb: float = 0.0
+    remaining_mb: float = 1000.0
+    percent_used: float = 0.0
+    last_recharge_date: Optional[str] = None
+    expires_at: Optional[str] = None
+    validity_days: int = 30
+    days_remaining: Optional[int] = None
+    is_expired: bool = False
+    is_expiring_soon: bool = False
+    is_data_limit_near: bool = False
+    is_data_exhausted: bool = False
+    status_label: str = "Sin paquete móvil configurado"
+    status_tone: str = "neutral"
+
+
+class GatewayCellularConfigDTO(BaseModel):
+    gateway_id: str
+    enabled: bool = False
+    carrier: str = "Telcel"
+    phone_number: Optional[str] = None
+    sim_iccid: Optional[str] = None
+    data_plan_mb: float = 1000.0
+    consumed_mb: float = 0.0
+    last_recharge_date: Optional[str] = None
+    validity_days: int = 30
+    alert_percent: int = 80
+    alert_days_before: int = 3
+    notes: Optional[str] = None
+
+
+class GatewayCellularUpdateDTO(BaseModel):
+    enabled: Optional[bool] = None
+    carrier: Optional[str] = None
+    phone_number: Optional[str] = None
+    sim_iccid: Optional[str] = None
+    data_plan_mb: Optional[float] = Field(None, gt=0, description="Cuota de datos contratada en MB")
+    consumed_mb: Optional[float] = Field(None, ge=0, description="Ajuste manual de MB consumidos")
+    last_recharge_date: Optional[str] = None
+    validity_days: Optional[int] = Field(None, ge=1, le=365)
+    alert_percent: Optional[int] = Field(None, ge=10, le=100)
+    alert_days_before: Optional[int] = Field(None, ge=0, le=30)
+    notes: Optional[str] = None
+
+
+class GatewayCellularRechargeDTO(BaseModel):
+    recharge_date: Optional[str] = None
+    validity_days: Optional[int] = Field(None, ge=1, le=365)
+    new_data_plan_mb: Optional[float] = Field(None, gt=0)
+    reset_consumed: bool = True
+    initial_consumed_mb: float = 0.0
+
+
 class GatewayMetadataDTO(BaseModel):
     gateway_id: str
     name: str
@@ -326,6 +384,7 @@ class GatewayMetadataDTO(BaseModel):
     longitude: Optional[float] = None
     location_display: str = "No disponible"
     has_active_alarm: bool = False
+    cellular: Optional[GatewayCellularStatusDTO] = None
 
 
 class LocationUpdateRequest(BaseModel):

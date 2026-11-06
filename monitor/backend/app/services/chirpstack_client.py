@@ -20,8 +20,11 @@ def evaluate_communication_state(
     """
     Calcula el estado operativo real a partir de la última actividad conocida (lastSeenAt)
     y un umbral configurable (en segundos o minutos). Por defecto evalúa en minutos para compatibilidad.
+    Garantiza que ambos datetimes sean timezone-aware en UTC para evitar desfases o TypeErrors.
     """
     current_time = now or datetime.now(timezone.utc)
+    current_time = current_time.astimezone(timezone.utc)
+
     if last_seen_at is None:
         return (
             "UNKNOWN",
@@ -29,6 +32,8 @@ def evaluate_communication_state(
             "Sin registro previo de transmisión en ChirpStack (nunca visto)",
             None,
         )
+
+    last_seen_at = last_seen_at.astimezone(timezone.utc)
 
     elapsed_seconds = max(0.0, (current_time - last_seen_at).total_seconds())
     elapsed_seconds_int = int(elapsed_seconds)
@@ -220,9 +225,19 @@ def parse_chirpstack_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict
         event_time_str = parsed.get("time")
         if isinstance(event_time_str, str):
             try:
-                event_time = datetime.fromisoformat(event_time_str.replace("Z", "+00:00"))
+                dt_cand = datetime.fromisoformat(event_time_str.replace("Z", "+00:00"))
+                if dt_cand.tzinfo is None:
+                    dt_cand = dt_cand.replace(tzinfo=timezone.utc)
+                else:
+                    dt_cand = dt_cand.astimezone(timezone.utc)
+                # Si el reloj del gateway está dentro de 180s de now, conservar precisión;
+                # si tiene un desfase mayor (ej. 1h por zona horaria o reloj sin NTP), usar now.
+                if abs((now - dt_cand).total_seconds()) <= 180:
+                    event_time = dt_cand
+                else:
+                    event_time = now
             except ValueError:
-                pass
+                event_time = now
 
         device_name = device_info.get("deviceName") or dev_eui
         app_id = str(device_info.get("applicationId") or "")
@@ -406,7 +421,7 @@ def parse_chirpstack_mqtt_event(topic: str, raw_payload: bytes) -> Optional[Dict
             "name": device_name,
             "tenant_id": tenant_id,
             "application_id": app_id,
-            "last_seen_at": event_time,
+            "last_seen_at": now,
             "battery_level": battery_level,
             "external_power": external_power,
             "rssi": best_rssi,
@@ -1186,6 +1201,7 @@ class ChirpStackV4Client:
         if not value:
             return None
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.astimezone(timezone.utc)
         except ValueError:
             return None
